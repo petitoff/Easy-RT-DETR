@@ -48,3 +48,51 @@ Po treningu możesz narysować GT i predykcje na obrazach:
 ```bash
 .venv/bin/python scripts/visualize_pennfudan_predictions.py --checkpoint artifacts/pennfudan_cpu_3e.pt
 ```
+
+## Zdalne uruchamianie na Jupyter/Kaggle GPU
+
+Jeżeli masz działający zdalny Jupyter server i zainstalowane `pyrun-jupyter`, możesz odpalać trening lub wizualizację z tego repo przez:
+
+```bash
+.venv/bin/python scripts/run_remote.py train-pennfudan \
+  --url http://localhost:8888 \
+  --token YOUR_TOKEN \
+  --device cuda \
+  -- --epochs 15 --batch-size 2 --image-size 256 --output artifacts/pennfudan_kaggle_15e.pt
+```
+
+Skrypt:
+- synchronizuje cały projekt do zdalnego kernela,
+- odpala właściwy entrypoint przez wrapper `scripts/remote_dispatch.py`,
+- pobiera artefakty, np. checkpointy `artifacts/*.pt`.
+
+Dla większych datasetów możesz ominąć ciężki upload przez kernel i stage'ować dataset przez MinIO:
+
+```bash
+.venv/bin/python scripts/run_remote.py train-pennfudan \
+  --device cuda \
+  --minio-endpoint http://188.245.77.217:9000 \
+  --minio-access-key admin \
+  --minio-secret-key '...' \
+  -- --epochs 15 --batch-size 2 --image-size 256 --output artifacts/pennfudan_kaggle_15e.pt
+```
+
+Jeżeli lokalnie istnieje `data/PennFudanPed.zip` albo `data/PennFudanPed`, preset `train-pennfudan` automatycznie:
+- wrzuci dataset archive do MinIO,
+- wygeneruje presigned URL,
+- pobierze i rozpakuję dataset po stronie zdalnego kernela do `data/`,
+- uruchomi trening już bez synchronizowania lokalnego `data/` przez websocket.
+
+Dostępne presety:
+- `train-pennfudan`
+- `train-synthetic`
+- `eval-pennfudan`
+- `visualize-pennfudan`
+- `custom --script path/to/script.py`
+
+Treningowe skrypty mają teraz `--device auto|cpu|cuda`, więc ten sam entrypoint działa lokalnie i zdalnie.
+
+Uwagi praktyczne:
+- `artifacts/` są domyślnie wykluczane z synchronizacji, żeby nie wysyłać starych checkpointów.
+- preset `train-synthetic` wyklucza też `data/`, bo dataset nie jest tam potrzebny.
+- ustawienia MinIO możesz podać przez `--minio-*` albo przez `scripts/.env` (`MINIO_ENDPOINT`, `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY`, opcjonalnie `MINIO_BUCKET`).

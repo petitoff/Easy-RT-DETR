@@ -58,6 +58,8 @@ class SetCriterion(nn.Module):
         targets: list[dict[str, torch.Tensor]],
         aux_outputs: list[dict[str, torch.Tensor]] | None = None,
         o2m_duplicates: int = 1,
+        dn_outputs: dict[str, torch.Tensor] | None = None,
+        dn_meta: dict[str, object] | None = None,
     ) -> dict[str, torch.Tensor]:
         prepared_targets = self._repeat_targets(targets, repeats=o2m_duplicates)
         losses = self._loss_single(pred_logits, pred_boxes, prepared_targets)
@@ -66,6 +68,15 @@ class SetCriterion(nn.Module):
                 aux_loss = self._loss_single(aux_output["pred_logits"], aux_output["pred_boxes"], prepared_targets)
                 for key, value in aux_loss.items():
                     losses[f"{key}_aux_{layer_id}"] = value
+        if dn_outputs is not None and dn_meta is not None:
+            dn_loss = self._loss_denoising(dn_outputs["pred_logits"], dn_outputs["pred_boxes"], targets, dn_meta)
+            if "aux_outputs" in dn_outputs:
+                for layer_id, aux_output in enumerate(dn_outputs["aux_outputs"]):
+                    aux_dn_loss = self._loss_denoising(aux_output["pred_logits"], aux_output["pred_boxes"], targets, dn_meta)
+                    for key, value in aux_dn_loss.items():
+                        dn_loss[f"{key}_aux_{layer_id}"] = value
+            for key, value in dn_loss.items():
+                losses[f"{key}_dn"] = value
         return losses
 
     def _repeat_targets(self, targets: list[dict[str, torch.Tensor]], repeats: int) -> list[dict[str, torch.Tensor]]:
@@ -100,6 +111,58 @@ class SetCriterion(nn.Module):
             target_classes[batch_id, src_idx, targets[batch_id]["labels"][tgt_idx]] = 1.0
             matched_boxes.append(pred_boxes[batch_id, src_idx])
             matched_targets.append(targets[batch_id]["boxes"][tgt_idx])
+
+        loss_cls = sigmoid_focal_loss(
+            pred_logits,
+            target_classes,
+            alpha=self.focal_alpha,
+            gamma=self.focal_gamma,
+            reduction="sum",
+        ) / normalizer
+
+        if matched_boxes:
+            src_boxes = torch.cat(matched_boxes, dim=0)
+            tgt_boxes = torch.cat(matched_targets, dim=0)
+            loss_bbox = F.l1_loss(src_boxes, tgt_boxes, reduction="sum") / normalizer
+            loss_giou = (1.0 - torch.diag(generalized_box_iou(box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(tgt_boxes)))).sum()
+            loss_giou = loss_giou / normalizer
+        else:
+            zero = pred_boxes.sum() * 0.0
+            loss_bbox = zero
+            loss_giou = zero
+
+        return {
+            "loss_cls": loss_cls * self.cls_weight,
+            "loss_bbox": loss_bbox * self.bbox_weight,
+            "loss_giou": loss_giou * self.giou_weight,
+        }
+
+    def _loss_denoising(
+        self,
+        pred_logits: torch.Tensor,
+        pred_boxes: torch.Tensor,
+        targets: list[dict[str, torch.Tensor]],
+        dn_meta: dict[str, object],
+    ) -> dict[str, torch.Tensor]:
+        num_groups = int(dn_meta["dn_num_group"])
+        normalizer = max(float(sum(len(target["labels"]) for target in targets) * num_groups), 1.0)
+        target_classes = torch.zeros_like(pred_logits)
+        matched_boxes = []
+        matched_targets = []
+
+        dn_positive_idx = dn_meta["dn_positive_idx"]
+        for batch_id, target in enumerate(targets):
+            labels = target["labels"]
+            boxes = target["boxes"]
+            if labels.numel() == 0:
+                continue
+            pos_idx = dn_positive_idx[batch_id].to(device=pred_logits.device, dtype=torch.long)
+            if pos_idx.numel() == 0:
+                continue
+            gt_idx = torch.arange(labels.numel(), device=pred_logits.device, dtype=torch.long).repeat(num_groups)
+            target_classes[batch_id, pos_idx, labels[gt_idx]] = 1.0
+            matched_boxes.append(pred_boxes[batch_id, pos_idx])
+            matched_targets.append(boxes[gt_idx])
 
         loss_cls = sigmoid_focal_loss(
             pred_logits,

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 from torch import nn
@@ -14,7 +14,12 @@ from .utils import inverse_sigmoid
 class QueryGroup:
     name: str
     count: int
+    matching_count: int | None = None
+    dn_count: int = 0
     o2m_duplicates: int = 1
+    training_only: bool = False
+    attn_mask: torch.Tensor | None = field(default=None, repr=False, compare=False)
+    dn_meta: dict[str, object] | None = field(default=None, repr=False, compare=False)
 
 
 class RTDETRDecoderLayer(nn.Module):
@@ -36,6 +41,13 @@ class RTDETRDecoderLayer(nn.Module):
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.norm2 = nn.LayerNorm(hidden_dim)
         self.norm3 = nn.LayerNorm(hidden_dim)
+        self._reset_parameters()
+
+    def _reset_parameters(self) -> None:
+        nn.init.xavier_uniform_(self.linear1.weight)
+        nn.init.constant_(self.linear1.bias, 0.0)
+        nn.init.xavier_uniform_(self.linear2.weight)
+        nn.init.constant_(self.linear2.bias, 0.0)
 
     def forward(
         self,
@@ -67,6 +79,7 @@ class RTDETRDecoder(nn.Module):
         dropout: float,
         num_levels: int,
         num_points: int,
+        query_pos_head_inv_sig: bool = False,
     ) -> None:
         super().__init__()
         self.layers = nn.ModuleList(
@@ -76,6 +89,7 @@ class RTDETRDecoder(nn.Module):
             ]
         )
         self.query_pos_head = MLP(4, hidden_dim * 2, hidden_dim, num_layers=2)
+        self.query_pos_head_inv_sig = query_pos_head_inv_sig
 
     def forward(
         self,
@@ -92,8 +106,10 @@ class RTDETRDecoder(nn.Module):
         boxes = []
         logits = []
         for layer_id, layer in enumerate(self.layers):
-            query_pos = self.query_pos_head(inverse_sigmoid(reference_points))
-            output = layer(output, reference_points.unsqueeze(2), memory, spatial_shapes, attn_mask, query_pos)
+            query_pos_input = inverse_sigmoid(reference_points) if self.query_pos_head_inv_sig else reference_points
+            query_pos = self.query_pos_head(query_pos_input)
+            reference_points_input = reference_points.unsqueeze(2)
+            output = layer(output, reference_points_input, memory, spatial_shapes, attn_mask, query_pos)
             pred_boxes = (box_heads[layer_id](output) + inverse_sigmoid(reference_points)).sigmoid()
             pred_logits = class_heads[layer_id](output)
             boxes.append(pred_boxes)
@@ -116,8 +132,15 @@ def build_group_attention_mask(
     begin = 0
     for index, group in enumerate(groups):
         end = begin + group.count
-        if index > 0:
-            random_mask = torch.rand(group.count, group.count, device=device) > keep_prob
-            mask[begin:end, begin:end] = random_mask
+        block_mask = group.attn_mask
+        if block_mask is None:
+            block_mask = torch.zeros(group.count, group.count, dtype=torch.bool, device=device)
+            should_perturb = index > 0 and not group.training_only
+            if should_perturb:
+                block_mask = torch.rand(group.count, group.count, device=device) > keep_prob
+                block_mask.fill_diagonal_(False)
+        else:
+            block_mask = block_mask.to(device=device, dtype=torch.bool)
+        mask[begin:end, begin:end] = block_mask
         begin = end
     return mask

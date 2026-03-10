@@ -27,3 +27,12 @@ class DecoderHeadBundle(nn.Module):
         box_head = MLP(hidden_dim, hidden_dim, 4, num_layers=3)
         self.class_heads = nn.ModuleList([copy.deepcopy(cls_head) for _ in range(num_layers)])
         self.box_heads = nn.ModuleList([copy.deepcopy(box_head) for _ in range(num_layers)])
+        self._reset_parameters()
+
+    def _reset_parameters(self) -> None:
+        bias_cls = -torch.log(torch.tensor((1.0 - 0.01) / 0.01)).item()
+        for class_head, box_head in zip(self.class_heads, self.box_heads):
+            nn.init.xavier_uniform_(class_head.weight)
+            nn.init.constant_(class_head.bias, bias_cls)
+            nn.init.constant_(box_head.layers[-1].weight, 0.0)
+            nn.init.constant_(box_head.layers[-1].bias, 0.0)

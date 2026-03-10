@@ -11,6 +11,7 @@ class RTDETRv3Config:
     pretrained_backbone: bool = False
     hidden_dim: int = 256
     num_feature_levels: int = 3
+    feat_strides: tuple[int, ...] = (8, 16, 32)
     num_queries: int = 300
     num_decoder_layers: int = 6
     num_heads: int = 8
@@ -22,6 +23,11 @@ class RTDETRv3Config:
     o2m_branch: bool = True
     num_queries_o2m: int = 300
     o2m_duplicates: int = 4
+    learnt_init_query: bool = True
+    query_pos_head_inv_sig: bool = False
+    num_denoising: int = 100
+    label_noise_ratio: float = 0.5
+    box_noise_scale: float = 1.0
     auxiliary_topk: int = 9
     auxiliary_hidden_dim: int = 128
     cls_loss_weight: float = 1.0
@@ -35,6 +41,7 @@ class RTDETRv3Config:
     inference_topk: int = 300
     inference_score_threshold: float = 0.18
     inference_nms_threshold: float = 0.25
+    anchor_eps: float = 1e-2
     image_mean: tuple[float, float, float] = (0.485, 0.456, 0.406)
     image_std: tuple[float, float, float] = (0.229, 0.224, 0.225)
 

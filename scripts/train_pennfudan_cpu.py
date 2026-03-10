@@ -12,7 +12,7 @@ from easy_rtdetr.datasets import PennFudanPedDataset, detection_collate_fn, spli
 from easy_rtdetr.model import RTDETRv3
 
 
-def build_cpu_model(pretrained_backbone: bool = True) -> RTDETRv3:
+def build_model(pretrained_backbone: bool = True) -> RTDETRv3:
     config = RTDETRv3Config(
         num_classes=1,
         backbone_name="resnet18",
@@ -33,6 +33,15 @@ def build_cpu_model(pretrained_backbone: bool = True) -> RTDETRv3:
         inference_topk=10,
     )
     return RTDETRv3(config)
+
+
+def resolve_device(device_arg: str) -> torch.device:
+    if device_arg == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(device_arg)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but not available.")
+    return device
 
 
 def make_dataloaders(args: argparse.Namespace) -> tuple[DataLoader, PennFudanPedDataset]:
@@ -57,13 +66,13 @@ def make_dataloaders(args: argparse.Namespace) -> tuple[DataLoader, PennFudanPed
 
 
 def train(args: argparse.Namespace) -> None:
-    device = torch.device("cpu")
+    device = resolve_device(args.device)
     torch.manual_seed(args.seed)
     train_loader, eval_dataset = make_dataloaders(args)
-    model = build_cpu_model(pretrained_backbone=args.pretrained_backbone).to(device)
+    model = build_model(pretrained_backbone=args.pretrained_backbone).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
-    print("Training on CPU with Penn-Fudan Pedestrian")
+    print(f"Training on {device.type.upper()} with Penn-Fudan Pedestrian")
     print(f"data_root={args.data_root}")
     print(f"epochs={args.epochs} batch_size={args.batch_size} image_size={args.image_size}")
     print(f"train_batches={len(train_loader)} eval_samples={len(eval_dataset)}")
@@ -135,6 +144,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-eval-samples", type=int, default=None)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--preview-topk", type=int, default=5)
     parser.add_argument("--output", type=str, default="artifacts/pennfudan_cpu_checkpoint.pt")
     parser.set_defaults(pretrained_backbone=True)

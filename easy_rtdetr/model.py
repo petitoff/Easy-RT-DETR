@@ -34,6 +34,12 @@ class RTDETRv3(nn.Module):
             o2m_branch=config.o2m_branch,
             num_queries_o2m=config.num_queries_o2m,
             o2m_duplicates=config.o2m_duplicates,
+            feat_strides=config.feat_strides,
+            learnt_init_query=config.learnt_init_query,
+            num_denoising=config.num_denoising,
+            label_noise_ratio=config.label_noise_ratio,
+            box_noise_scale=config.box_noise_scale,
+            anchor_eps=config.anchor_eps,
         )
         self.decoder = RTDETRDecoder(
             hidden_dim=config.hidden_dim,
@@ -43,6 +49,7 @@ class RTDETRv3(nn.Module):
             dropout=config.dropout,
             num_levels=config.num_feature_levels,
             num_points=config.num_decoder_points,
+            query_pos_head_inv_sig=config.query_pos_head_inv_sig,
         )
         self.decoder_heads = DecoderHeadBundle(config.hidden_dim, config.num_classes, config.num_decoder_layers)
         self.auxiliary_head = AuxiliaryDenseHead(config.hidden_dim, config.auxiliary_hidden_dim, config.num_classes)
@@ -81,7 +88,7 @@ class RTDETRv3(nn.Module):
         images = (images - self.pixel_mean) / self.pixel_std
         features = self.backbone(images)
         encoder_output = self.encoder(features)
-        query_selection = self.query_selection(encoder_output.memory, encoder_output.spatial_shapes)
+        query_selection = self.query_selection(encoder_output.memory, encoder_output.spatial_shapes, targets=targets)
         attn_mask = build_group_attention_mask(
             query_selection.groups,
             keep_prob=self.config.perturbation_keep_prob,
@@ -91,7 +98,7 @@ class RTDETRv3(nn.Module):
         dec_boxes, dec_logits = self.decoder(
             target=query_selection.target,
             reference_points_unact=query_selection.reference_points_unact,
-            memory=encoder_output.memory,
+            memory=query_selection.memory,
             spatial_shapes=encoder_output.spatial_shapes,
             class_heads=self.decoder_heads.class_heads,
             box_heads=self.decoder_heads.box_heads,
@@ -123,22 +130,44 @@ class RTDETRv3(nn.Module):
         targets: list[dict[str, torch.Tensor]],
     ) -> dict[str, torch.Tensor]:
         losses: dict[str, torch.Tensor] = {}
-        start = 0
-        o2o_group_count = 0
+        dec_start = 0
+        enc_start = 0
+        normal_group_count = 0
         for group in selection.groups:
-            end = start + group.count
+            dec_end = dec_start + group.count
+            enc_end = enc_start + int(group.matching_count or group.count)
+            group_dec_boxes = dec_boxes[:, :, dec_start:dec_end]
+            group_dec_logits = dec_logits[:, :, dec_start:dec_end]
+            dn_count = group.dn_count
+
+            if dn_count > 0:
+                dn_boxes = group_dec_boxes[-1, :, :dn_count]
+                dn_logits = group_dec_logits[-1, :, :dn_count]
+                match_boxes = group_dec_boxes[-1, :, dn_count:]
+                match_logits = group_dec_logits[-1, :, dn_count:]
+                dn_aux_outputs = [
+                    {"pred_boxes": group_dec_boxes[layer_id, :, :dn_count], "pred_logits": group_dec_logits[layer_id, :, :dn_count]}
+                    for layer_id in range(group_dec_boxes.size(0) - 1)
+                ]
+            else:
+                dn_boxes = None
+                dn_logits = None
+                match_boxes = group_dec_boxes[-1]
+                match_logits = group_dec_logits[-1]
+                dn_aux_outputs = []
+
             group_outputs = {
-                "pred_boxes": dec_boxes[-1, :, start:end],
-                "pred_logits": dec_logits[-1, :, start:end],
+                "pred_boxes": match_boxes,
+                "pred_logits": match_logits,
             }
             aux_outputs = [
-                {"pred_boxes": selection.encoder_boxes[:, start:end], "pred_logits": selection.encoder_logits[:, start:end]}
+                {"pred_boxes": selection.encoder_boxes[:, enc_start:enc_end], "pred_logits": selection.encoder_logits[:, enc_start:enc_end]}
             ]
-            for layer_id in range(dec_boxes.size(0) - 1):
+            for layer_id in range(group_dec_boxes.size(0) - 1):
                 aux_outputs.append(
                     {
-                        "pred_boxes": dec_boxes[layer_id, :, start:end],
-                        "pred_logits": dec_logits[layer_id, :, start:end],
+                        "pred_boxes": group_dec_boxes[layer_id, :, dn_count:],
+                        "pred_logits": group_dec_logits[layer_id, :, dn_count:],
                     }
                 )
 
@@ -148,22 +177,33 @@ class RTDETRv3(nn.Module):
                 targets,
                 aux_outputs=aux_outputs,
                 o2m_duplicates=group.o2m_duplicates,
+                dn_outputs=(
+                    {
+                        "pred_boxes": dn_boxes,
+                        "pred_logits": dn_logits,
+                        "aux_outputs": dn_aux_outputs,
+                    }
+                    if dn_boxes is not None and dn_logits is not None
+                    else None
+                ),
+                dn_meta=group.dn_meta,
             )
 
             weight = self.config.o2m_loss_weight if group.o2m_duplicates > 1 else self.config.o2o_loss_weight
             prefix = group.name
             for key, value in group_loss.items():
                 losses[f"{key}_{prefix}"] = value * weight
-            if group.o2m_duplicates == 1:
-                o2o_group_count += 1
-            start = end
+            if group.o2m_duplicates == 1 and not group.training_only:
+                normal_group_count += 1
+            dec_start = dec_end
+            enc_start = enc_end
 
-        if o2o_group_count > 1:
+        if normal_group_count > 1:
             for key in list(losses.keys()):
                 if key.endswith("o2m"):
                     continue
                 if "_o2o_" in key:
-                    losses[key] = losses[key] / o2o_group_count
+                    losses[key] = losses[key] / normal_group_count
         return losses
 
     def extra_repr(self) -> str:

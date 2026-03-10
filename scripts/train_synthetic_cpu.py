@@ -79,7 +79,7 @@ def collate_fn(batch: list[tuple[torch.Tensor, dict[str, torch.Tensor]]]) -> tup
     return images, targets
 
 
-def build_tiny_cpu_model(num_classes: int) -> RTDETRv3:
+def build_tiny_model(num_classes: int) -> RTDETRv3:
     config = RTDETRv3Config(
         num_classes=num_classes,
         backbone_name="resnet18",
@@ -102,10 +102,19 @@ def build_tiny_cpu_model(num_classes: int) -> RTDETRv3:
     return RTDETRv3(config)
 
 
+def resolve_device(device_arg: str) -> torch.device:
+    if device_arg == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(device_arg)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but not available.")
+    return device
+
+
 def train(args: argparse.Namespace) -> None:
     torch.manual_seed(args.seed)
     random.seed(args.seed)
-    device = torch.device("cpu")
+    device = resolve_device(args.device)
 
     train_dataset = SyntheticDetectionDataset(
         num_samples=args.train_samples,
@@ -129,10 +138,10 @@ def train(args: argparse.Namespace) -> None:
         collate_fn=collate_fn,
     )
 
-    model = build_tiny_cpu_model(args.num_classes).to(device)
+    model = build_tiny_model(args.num_classes).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
-    print("Training on CPU with synthetic rectangles")
+    print(f"Training on {device.type.upper()} with synthetic rectangles")
     print(f"train_samples={args.train_samples} eval_samples={args.eval_samples} batch_size={args.batch_size}")
     print(f"image_size={args.image_size} epochs={args.epochs} num_classes={args.num_classes}")
 
@@ -206,6 +215,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-objects", type=int, default=3)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--preview-topk", type=int, default=5)
     parser.add_argument("--output", type=str, default="artifacts/synthetic_cpu_checkpoint.pt")
     return parser.parse_args()
