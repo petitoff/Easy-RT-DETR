@@ -52,7 +52,14 @@ class RTDETRv3(nn.Module):
             query_pos_head_inv_sig=config.query_pos_head_inv_sig,
         )
         self.decoder_heads = DecoderHeadBundle(config.hidden_dim, config.num_classes, config.num_decoder_layers)
-        self.auxiliary_head = AuxiliaryDenseHead(config.hidden_dim, config.auxiliary_hidden_dim, config.num_classes)
+        self.auxiliary_head = AuxiliaryDenseHead(
+            in_channels=config.hidden_dim,
+            num_classes=config.num_classes,
+            fpn_strides=config.feat_strides,
+            reg_max=config.aux_reg_max,
+            grid_cell_scale=config.aux_grid_cell_scale,
+            grid_cell_offset=config.aux_grid_cell_offset,
+        )
         self.matcher = HungarianMatcher(
             cls_cost=config.cls_loss_weight,
             bbox_cost=config.bbox_loss_weight,
@@ -69,9 +76,16 @@ class RTDETRv3(nn.Module):
         )
         self.auxiliary_criterion = AuxiliaryDenseCriterion(
             num_classes=config.num_classes,
-            topk=config.auxiliary_topk,
-            focal_alpha=config.focal_alpha,
-            focal_gamma=config.focal_gamma,
+            reg_max=config.aux_reg_max,
+            static_assigner_topk=config.aux_static_assigner_topk,
+            task_aligned_topk=config.aux_task_aligned_topk,
+            task_aligned_alpha=config.aux_task_aligned_alpha,
+            task_aligned_beta=config.aux_task_aligned_beta,
+            static_assigner_epoch=config.aux_static_assigner_epoch,
+            use_varifocal_loss=config.aux_use_varifocal_loss,
+            loss_weight_class=config.aux_loss_weight_class,
+            loss_weight_iou=config.aux_loss_weight_iou,
+            loss_weight_dfl=config.aux_loss_weight_dfl,
         )
         self.postprocessor = RTDETRPostProcessor(
             topk=config.inference_topk,
@@ -83,6 +97,7 @@ class RTDETRv3(nn.Module):
         self,
         images: torch.Tensor | list[torch.Tensor],
         targets: list[dict[str, torch.Tensor]] | None = None,
+        epoch: int | None = None,
     ) -> dict[str, torch.Tensor] | list[dict[str, torch.Tensor]]:
         images = batch_images(images)
         images = (images - self.pixel_mean) / self.pixel_std
@@ -113,10 +128,15 @@ class RTDETRv3(nn.Module):
             raise ValueError("Targets are required while training.")
 
         losses = self._compute_detection_losses(dec_boxes, dec_logits, query_selection, targets)
-        aux_logits, aux_boxes, aux_locations = self.auxiliary_head(encoder_output.features)
-        aux_losses = self.auxiliary_criterion(aux_logits, aux_boxes, aux_locations, targets)
+        aux_outputs = self.auxiliary_head(encoder_output.features)
+        aux_losses = self.auxiliary_criterion(
+            aux_outputs,
+            targets,
+            image_size=tuple(images.shape[-2:]),
+            epoch=epoch,
+        )
         for key, value in aux_losses.items():
-            losses[f"{key}_auxiliary"] = value * self.config.auxiliary_loss_weight
+            losses[f"{key}_aux_o2m"] = value * self.config.auxiliary_loss_weight
 
         total_loss = sum(losses.values())
         losses["loss"] = total_loss

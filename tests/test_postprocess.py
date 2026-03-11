@@ -6,7 +6,7 @@ from easy_rtdetr.postprocess import RTDETRPostProcessor
 
 
 def test_postprocess_scales_boxes():
-    processor = RTDETRPostProcessor(topk=5)
+    processor = RTDETRPostProcessor(topk=5, score_threshold=0.0)
     logits = torch.randn(1, 10, 3)
     boxes = torch.rand(1, 10, 4)
     outputs = processor(logits, boxes, image_sizes=torch.tensor([[480, 640]]))

@@ -22,6 +22,23 @@ def box_xyxy_to_cxcywh(boxes: torch.Tensor) -> torch.Tensor:
     return torch.stack(((x0 + x1) / 2.0, (y0 + y1) / 2.0, x1 - x0, y1 - y0), dim=-1)
 
 
+def distance_to_bbox(points: torch.Tensor, distances: torch.Tensor) -> torch.Tensor:
+    while points.ndim < distances.ndim:
+        points = points.unsqueeze(0)
+    x, y = points[..., 0], points[..., 1]
+    l, t, r, b = distances.unbind(dim=-1)
+    return torch.stack((x - l, y - t, x + r, y + b), dim=-1)
+
+
+def bbox_to_distance(points: torch.Tensor, boxes: torch.Tensor, max_distance: float) -> torch.Tensor:
+    while points.ndim < boxes.ndim:
+        points = points.unsqueeze(0)
+    x, y = points[..., 0], points[..., 1]
+    x0, y0, x1, y1 = boxes.unbind(dim=-1)
+    distances = torch.stack((x - x0, y - y0, x1 - x, y1 - y), dim=-1)
+    return distances.clamp(min=0.0, max=max_distance - 1e-2)
+
+
 def box_area(boxes: torch.Tensor) -> torch.Tensor:
     wh = (boxes[..., 2:] - boxes[..., :2]).clamp(min=0)
     return wh[..., 0] * wh[..., 1]

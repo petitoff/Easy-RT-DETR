@@ -4,6 +4,7 @@ import runpy
 import shutil
 import sys
 import tarfile
+import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -49,6 +50,25 @@ def bootstrap_dataset() -> None:
     print(f"remote_dataset_ready={expected_root}")
 
 
+def upload_artifact() -> None:
+    if not remote_artifact:
+        return
+
+    remote_path = Path(remote_artifact["remote_path"])
+    if not remote_path.is_absolute():
+        remote_path = Path.cwd() / remote_path
+    if not remote_path.exists():
+        raise FileNotFoundError(f"Remote artifact missing: {remote_path}")
+
+    request = urllib.request.Request(remote_artifact["put_url"], method="PUT")
+    request.add_header("Content-Type", "application/octet-stream")
+    with remote_path.open("rb") as source, urllib.request.urlopen(request, data=source.read()) as response:
+        status = getattr(response, "status", 200)
+        if status >= 400:
+            raise urllib.error.HTTPError(remote_artifact["put_url"], status, "artifact upload failed", response.headers, None)
+    print(f"remote_artifact_uploaded={remote_artifact['object_name']}")
+
+
 def main() -> None:
     bootstrap_dataset()
     script = Path(remote_script)
@@ -61,6 +81,7 @@ def main() -> None:
 
     sys.argv = [str(script), *argv]
     runpy.run_path(str(script), run_name="__main__")
+    upload_artifact()
 
 
 if __name__ == "__main__":

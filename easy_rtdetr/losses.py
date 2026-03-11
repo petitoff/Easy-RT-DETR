@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from collections import defaultdict
-
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+from .assigners import ATSSAssigner, TaskAlignedAssigner
 from .matcher import HungarianMatcher
-from .utils import box_cxcywh_to_xyxy, generalized_box_iou
+from .utils import bbox_to_distance, box_cxcywh_to_xyxy, generalized_box_iou
 
 
 def sigmoid_focal_loss(
@@ -194,69 +193,132 @@ class AuxiliaryDenseCriterion(nn.Module):
     def __init__(
         self,
         num_classes: int,
-        topk: int = 9,
-        focal_alpha: float = 0.25,
-        focal_gamma: float = 2.0,
+        reg_max: int = 16,
+        static_assigner_topk: int = 9,
+        task_aligned_topk: int = 13,
+        task_aligned_alpha: float = 1.0,
+        task_aligned_beta: float = 6.0,
+        static_assigner_epoch: int = 30,
+        use_varifocal_loss: bool = True,
+        loss_weight_class: float = 1.0,
+        loss_weight_iou: float = 2.5,
+        loss_weight_dfl: float = 0.5,
     ) -> None:
         super().__init__()
         self.num_classes = num_classes
-        self.topk = topk
-        self.focal_alpha = focal_alpha
-        self.focal_gamma = focal_gamma
+        self.reg_max = reg_max
+        self.reg_channels = reg_max + 1
+        self.static_assigner_epoch = static_assigner_epoch
+        self.use_varifocal_loss = use_varifocal_loss
+        self.loss_weight_class = loss_weight_class
+        self.loss_weight_iou = loss_weight_iou
+        self.loss_weight_dfl = loss_weight_dfl
+        self.static_assigner = ATSSAssigner(topk=static_assigner_topk)
+        self.task_aligned_assigner = TaskAlignedAssigner(
+            topk=task_aligned_topk,
+            alpha=task_aligned_alpha,
+            beta=task_aligned_beta,
+        )
 
     def forward(
         self,
-        pred_logits: list[torch.Tensor],
-        pred_boxes: list[torch.Tensor],
-        locations: list[torch.Tensor],
+        aux_outputs,
         targets: list[dict[str, torch.Tensor]],
+        image_size: tuple[int, int],
+        epoch: int | None = None,
     ) -> dict[str, torch.Tensor]:
-        all_logits = torch.cat(pred_logits, dim=1)
-        all_boxes = torch.cat(pred_boxes, dim=1)
-        all_locations = torch.cat(locations, dim=0)
-        target_classes = torch.zeros_like(all_logits)
-        positives: dict[int, list[int]] = defaultdict(list)
-        target_boxes: dict[int, list[torch.Tensor]] = defaultdict(list)
+        pred_scores = aux_outputs.pred_scores
+        pred_distri = aux_outputs.pred_distri
+        pred_boxes = aux_outputs.pred_boxes
+        anchor_boxes = aux_outputs.anchor_boxes
+        anchor_points = aux_outputs.anchor_points
+        stride_tensor = aux_outputs.stride_tensor
+        num_anchors_list = aux_outputs.num_anchors_list
 
-        for batch_index, target in enumerate(targets):
-            if target["labels"].numel() == 0:
-                continue
-            gt_centers = target["boxes"][:, :2]
-            distances = torch.cdist(all_locations, gt_centers)
-            k = min(self.topk, all_locations.size(0))
-            indices = distances.topk(k, largest=False, dim=0).indices
-            for gt_index in range(indices.size(1)):
-                pos_idx = indices[:, gt_index]
-                positives[batch_index].extend(pos_idx.tolist())
-                target_classes[batch_index, pos_idx, target["labels"][gt_index]] = 1.0
-                target_boxes[batch_index].append(target["boxes"][gt_index].repeat(pos_idx.numel(), 1))
+        height, width = image_size
+        scale = pred_boxes.new_tensor([width, height, width, height])
+        gt_labels = [target["labels"].to(device=pred_boxes.device, dtype=torch.long) for target in targets]
+        gt_boxes = [box_cxcywh_to_xyxy(target["boxes"].to(pred_boxes.device)) * scale for target in targets]
 
-        loss_cls = sigmoid_focal_loss(
-            all_logits,
-            target_classes,
-            alpha=self.focal_alpha,
-            gamma=self.focal_gamma,
-            reduction="mean",
-        )
-
-        box_losses = []
-        giou_losses = []
-        for batch_index, positive_indices in positives.items():
-            if not positive_indices:
-                continue
-            pos_idx = torch.as_tensor(positive_indices, device=all_boxes.device, dtype=torch.long)
-            pred = all_boxes[batch_index, pos_idx]
-            tgt = torch.cat(target_boxes[batch_index], dim=0)
-            box_losses.append(F.l1_loss(pred, tgt, reduction="mean"))
-            giou_losses.append(
-                (1.0 - torch.diag(generalized_box_iou(box_cxcywh_to_xyxy(pred), box_cxcywh_to_xyxy(tgt)))).mean()
+        if epoch is not None and epoch <= self.static_assigner_epoch:
+            assignment = self.static_assigner(
+                anchor_boxes=anchor_boxes,
+                num_anchors_list=num_anchors_list,
+                gt_labels=gt_labels,
+                gt_boxes=gt_boxes,
+                num_classes=self.num_classes,
+                pred_boxes=pred_boxes.detach(),
+            )
+        else:
+            assignment = self.task_aligned_assigner(
+                pred_scores=pred_scores.detach(),
+                pred_boxes=pred_boxes.detach(),
+                anchor_points=anchor_points,
+                gt_labels=gt_labels,
+                gt_boxes=gt_boxes,
+                num_classes=self.num_classes,
             )
 
-        zero = all_boxes.sum() * 0.0
-        loss_bbox = torch.stack(box_losses).mean() if box_losses else zero
-        loss_giou = torch.stack(giou_losses).mean() if giou_losses else zero
+        if self.use_varifocal_loss:
+            one_hot = F.one_hot(assignment.labels.clamp(max=self.num_classes), self.num_classes + 1)[..., : self.num_classes]
+            loss_cls = self._varifocal_loss(pred_scores, assignment.scores, one_hot.to(pred_scores.dtype))
+        else:
+            target_scores = assignment.scores
+            loss_cls = F.binary_cross_entropy(pred_scores, target_scores, reduction="sum")
+
+        assigned_scores_sum = assignment.scores.sum().clamp(min=1.0)
+        loss_cls = self.loss_weight_class * (loss_cls / assigned_scores_sum)
+
+        positive_mask = assignment.labels != self.num_classes
+        if positive_mask.any():
+            bbox_weight = assignment.scores.sum(dim=-1)[positive_mask]
+            pred_boxes_pos = pred_boxes[positive_mask]
+            assigned_boxes_pos = assignment.boxes[positive_mask]
+            loss_iou = 1.0 - torch.diag(generalized_box_iou(pred_boxes_pos, assigned_boxes_pos))
+            loss_iou = self.loss_weight_iou * ((loss_iou * bbox_weight).sum() / assigned_scores_sum)
+
+            pred_dist_pos = pred_distri[positive_mask].view(-1, 4, self.reg_channels)
+            anchor_points_scaled = anchor_points / stride_tensor
+            assigned_boxes_scaled = assignment.boxes / stride_tensor.unsqueeze(0)
+            assigned_ltrb = bbox_to_distance(anchor_points_scaled, assigned_boxes_scaled, float(self.reg_max))
+            assigned_ltrb_pos = assigned_ltrb[positive_mask]
+            loss_dfl = self._distribution_focal_loss(pred_dist_pos, assigned_ltrb_pos)
+            loss_dfl = self.loss_weight_dfl * ((loss_dfl * bbox_weight.unsqueeze(-1)).sum() / assigned_scores_sum)
+        else:
+            zero = pred_boxes.sum() * 0.0
+            loss_iou = zero
+            loss_dfl = zero
+
         return {
             "loss_cls": loss_cls,
-            "loss_bbox": loss_bbox,
-            "loss_giou": loss_giou,
+            "loss_iou": loss_iou,
+            "loss_dfl": loss_dfl,
         }
+
+    @staticmethod
+    def _varifocal_loss(
+        pred_score: torch.Tensor,
+        gt_score: torch.Tensor,
+        label: torch.Tensor,
+        alpha: float = 0.75,
+        gamma: float = 2.0,
+    ) -> torch.Tensor:
+        weight = alpha * pred_score.detach().pow(gamma) * (1.0 - label) + gt_score * label
+        return F.binary_cross_entropy(pred_score, gt_score, weight=weight, reduction="sum")
+
+    def _distribution_focal_loss(self, pred_dist: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        target_left = target.floor().long()
+        target_right = (target_left + 1).clamp(max=self.reg_max)
+        weight_left = target_right.to(pred_dist.dtype) - target
+        weight_right = 1.0 - weight_left
+        loss_left = F.cross_entropy(
+            pred_dist.reshape(-1, self.reg_channels),
+            target_left.reshape(-1),
+            reduction="none",
+        ).view_as(target) * weight_left
+        loss_right = F.cross_entropy(
+            pred_dist.reshape(-1, self.reg_channels),
+            target_right.reshape(-1),
+            reduction="none",
+        ).view_as(target) * weight_right
+        return (loss_left + loss_right).mean(dim=-1)

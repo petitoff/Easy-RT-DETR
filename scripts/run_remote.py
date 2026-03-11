@@ -176,6 +176,47 @@ def stage_dataset_via_minio(
     }
 
 
+def prepare_remote_artifact_via_minio(
+    endpoint: str,
+    access_key: str,
+    secret_key: str,
+    bucket: str,
+    object_name: str,
+    expiry_hours: int,
+) -> dict[str, str]:
+    client = build_minio_client(endpoint, access_key, secret_key)
+    ensure_bucket_exists(client, bucket)
+    return {
+        "put_url": client.presigned_put_object(bucket, object_name, expires=timedelta(hours=expiry_hours)),
+        "get_url": client.presigned_get_object(bucket, object_name, expires=timedelta(hours=expiry_hours)),
+        "bucket": bucket,
+        "object_name": object_name,
+    }
+
+
+def download_minio_object(
+    endpoint: str,
+    access_key: str,
+    secret_key: str,
+    bucket: str,
+    object_name: str,
+    destination: Path,
+) -> Path:
+    client = build_minio_client(endpoint, access_key, secret_key)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    client.fget_object(bucket, object_name, str(destination))
+    return destination
+
+
+def extract_output_path(script_args: list[str]) -> str | None:
+    for index, arg in enumerate(script_args):
+        if arg == "--output" and index + 1 < len(script_args):
+            return script_args[index + 1]
+        if arg.startswith("--output="):
+            return arg.split("=", 1)[1]
+    return None
+
+
 class ChunkedJupyterRunner(JupyterRunner):
     def __init__(self, *args, upload_chunk_bytes: int = 128 * 1024, download_chunk_bytes: int = 128 * 1024, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -440,12 +481,13 @@ def main() -> None:
     local_artifact_dir = Path(args.artifact_dir) / args.preset.replace("/", "_")
     dataset_source_arg = Path(args.dataset_source) if args.dataset_source else infer_default_dataset_source(args.preset)
     remote_dataset: dict[str, str] | None = None
+    remote_artifact: dict[str, str] | None = None
+    minio_values = [args.minio_endpoint, args.minio_access_key, args.minio_secret_key]
 
     if dataset_source_arg is not None:
         dataset_source = dataset_source_arg.expanduser().resolve()
         if not dataset_source.exists():
             raise FileNotFoundError(f"Dataset source does not exist: {dataset_source}")
-        minio_values = [args.minio_endpoint, args.minio_access_key, args.minio_secret_key]
         if not all(minio_values):
             raise ValueError(
                 "Dataset staging via MinIO requires --minio-endpoint, --minio-access-key and --minio-secret-key "
@@ -464,6 +506,23 @@ def main() -> None:
         print(f"minio_bucket={remote_dataset['bucket']}")
         print(f"minio_object={remote_dataset['object_name']}")
         print(f"remote_dataset_expected_root={remote_dataset['expected_root']}")
+
+    output_path = extract_output_path(script_args)
+    if output_path is not None and all(minio_values):
+        artifact_object_name = f"artifacts/{args.preset.replace('/', '_')}/{Path(output_path).name}"
+        remote_artifact = prepare_remote_artifact_via_minio(
+            endpoint=args.minio_endpoint,
+            access_key=args.minio_access_key,
+            secret_key=args.minio_secret_key,
+            bucket=args.minio_bucket,
+            object_name=artifact_object_name,
+            expiry_hours=args.minio_expiry_hours,
+        )
+        remote_artifact["remote_path"] = output_path
+        remote_artifact["local_path"] = str(local_artifact_dir / output_path)
+        artifact_paths = []
+        print(f"artifact_minio_bucket={remote_artifact['bucket']}")
+        print(f"artifact_minio_object={remote_artifact['object_name']}")
 
     print(f"remote_url={args.url}")
     print(f"preset={args.preset}")
@@ -490,9 +549,22 @@ def main() -> None:
                 "remote_script": script_path,
                 "remote_argv": script_args,
                 "remote_dataset": remote_dataset,
+                "remote_artifact": remote_artifact,
             },
             timeout=args.timeout,
         )
+
+    if remote_artifact is not None:
+        downloaded = download_minio_object(
+            endpoint=args.minio_endpoint,
+            access_key=args.minio_access_key,
+            secret_key=args.minio_secret_key,
+            bucket=remote_artifact["bucket"],
+            object_name=remote_artifact["object_name"],
+            destination=Path(remote_artifact["local_path"]),
+        )
+        result.data.setdefault("artifacts", [])
+        result.data["artifacts"].append(str(downloaded))
 
     if result.stdout:
         print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")

@@ -95,8 +95,7 @@ def build_tiny_model(num_classes: int) -> RTDETRv3:
         o2m_branch=True,
         num_queries_o2m=40,
         o2m_duplicates=2,
-        auxiliary_topk=5,
-        auxiliary_hidden_dim=64,
+        aux_static_assigner_epoch=2,
         inference_topk=10,
     )
     return RTDETRv3(config)
@@ -162,7 +161,7 @@ def train(args: argparse.Namespace) -> None:
             ]
 
             optimizer.zero_grad(set_to_none=True)
-            losses = model(images, targets)
+            losses = model(images, targets, epoch=epoch + 1)
             loss = losses["loss"]
             loss.backward()
             optimizer.step()
