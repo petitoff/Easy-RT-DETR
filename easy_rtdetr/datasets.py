@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -7,10 +9,57 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 try:
-    from torchvision.transforms import functional as TF
     from torchvision.transforms import InterpolationMode
+    from torchvision.transforms import functional as TF
 except ImportError as exc:  # pragma: no cover
     raise ImportError("torchvision is required for dataset transforms.") from exc
+
+
+@dataclass(slots=True)
+class ResizeInfo:
+    scale: float
+    pad_left: int
+    pad_top: int
+
+
+def _letterbox_image(
+    image: Image.Image,
+    image_size: int,
+    interpolation: InterpolationMode = InterpolationMode.BILINEAR,
+) -> tuple[Image.Image, ResizeInfo]:
+    orig_width, orig_height = image.size
+    scale = min(image_size / orig_width, image_size / orig_height)
+    resized_width = max(1, round(orig_width * scale))
+    resized_height = max(1, round(orig_height * scale))
+
+    resized = TF.resize(image, [resized_height, resized_width], interpolation=interpolation)
+    pad_left = (image_size - resized_width) // 2
+    pad_top = (image_size - resized_height) // 2
+    pad_right = image_size - resized_width - pad_left
+    pad_bottom = image_size - resized_height - pad_top
+    padded = TF.pad(resized, [pad_left, pad_top, pad_right, pad_bottom], fill=0)
+    return padded, ResizeInfo(scale=scale, pad_left=pad_left, pad_top=pad_top)
+
+
+def _resize_xyxy_boxes(boxes: torch.Tensor, resize_info: ResizeInfo, image_size: int) -> torch.Tensor:
+    if boxes.numel() == 0:
+        return boxes.reshape(0, 4)
+    boxes = boxes.clone()
+    boxes[:, [0, 2]] = boxes[:, [0, 2]] * resize_info.scale + resize_info.pad_left
+    boxes[:, [1, 3]] = boxes[:, [1, 3]] * resize_info.scale + resize_info.pad_top
+    boxes = boxes.clamp(min=0.0, max=float(image_size))
+    return boxes
+
+
+def _xyxy_to_normalized_cxcywh(boxes: torch.Tensor, image_size: int) -> torch.Tensor:
+    if boxes.numel() == 0:
+        return boxes.reshape(0, 4)
+    x0, y0, x1, y1 = boxes.unbind(dim=-1)
+    cx = ((x0 + x1) / 2.0) / image_size
+    cy = ((y0 + y1) / 2.0) / image_size
+    w = (x1 - x0) / image_size
+    h = (y1 - y0) / image_size
+    return torch.stack((cx, cy, w, h), dim=-1)
 
 
 class PennFudanPedDataset(Dataset):
@@ -54,40 +103,98 @@ class PennFudanPedDataset(Dataset):
             x1 = xs.max().item() + 1
             y0 = ys.min().item()
             y1 = ys.max().item() + 1
-            cx = ((x0 + x1) / 2.0) / self.image_size
-            cy = ((y0 + y1) / 2.0) / self.image_size
-            bw = (x1 - x0) / self.image_size
-            bh = (y1 - y0) / self.image_size
-            boxes.append([cx, cy, bw, bh])
+            boxes.append([x0, y0, x1, y1])
             labels.append(0)
 
+        boxes_tensor = _xyxy_to_normalized_cxcywh(torch.tensor(boxes, dtype=torch.float32), self.image_size)
         target = {
             "labels": torch.tensor(labels, dtype=torch.long),
-            "boxes": torch.tensor(boxes, dtype=torch.float32),
+            "boxes": boxes_tensor,
         }
         return image, target
 
     def _resize_and_pad(self, image: Image.Image, mask: Image.Image) -> tuple[torch.Tensor, torch.Tensor]:
-        orig_width, orig_height = image.size
-        scale = min(self.image_size / orig_width, self.image_size / orig_height)
-        resized_width = max(1, round(orig_width * scale))
-        resized_height = max(1, round(orig_height * scale))
-
-        image = TF.resize(image, [resized_height, resized_width], interpolation=InterpolationMode.BILINEAR)
-        mask = TF.resize(mask, [resized_height, resized_width], interpolation=InterpolationMode.NEAREST)
-
-        pad_left = (self.image_size - resized_width) // 2
-        pad_top = (self.image_size - resized_height) // 2
-        pad_right = self.image_size - resized_width - pad_left
-        pad_bottom = self.image_size - resized_height - pad_top
-        padding = [pad_left, pad_top, pad_right, pad_bottom]
-
-        image = TF.pad(image, padding, fill=0)
-        mask = TF.pad(mask, padding, fill=0)
-
+        image, _ = _letterbox_image(image, self.image_size, interpolation=InterpolationMode.BILINEAR)
+        mask, _ = _letterbox_image(mask, self.image_size, interpolation=InterpolationMode.NEAREST)
         image_tensor = TF.pil_to_tensor(image).float() / 255.0
         mask_tensor = torch.as_tensor(TF.pil_to_tensor(mask), dtype=torch.int64).squeeze(0)
         return image_tensor, mask_tensor
+
+
+class PascalVOCCarDataset(Dataset):
+    def __init__(
+        self,
+        root: str | Path,
+        image_size: int = 256,
+        split: str = "trainval",
+        indices: list[int] | None = None,
+        keep_difficult: bool = False,
+        positive_only: bool = False,
+    ) -> None:
+        self.root = Path(root)
+        self.image_size = image_size
+        self.keep_difficult = keep_difficult
+        split_path = self.root / "ImageSets" / "Main" / f"{split}.txt"
+        if not split_path.exists():
+            raise FileNotFoundError(f"VOC split file not found: {split_path}")
+        identifiers = [line.strip() for line in split_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        if not identifiers:
+            raise FileNotFoundError(f"No image ids found in split: {split_path}")
+        if positive_only:
+            identifiers = [
+                image_id
+                for image_id in identifiers
+                if self._annotation_has_car(self.root / "Annotations" / f"{image_id}.xml")
+            ]
+            if not identifiers:
+                raise FileNotFoundError(f"No positive car samples found in split: {split_path}")
+        self.identifiers = identifiers if indices is None else [identifiers[index] for index in indices]
+
+    def __len__(self) -> int:
+        return len(self.identifiers)
+
+    def __getitem__(self, item: int) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        image_id = self.identifiers[item]
+        image_path = self.root / "JPEGImages" / f"{image_id}.jpg"
+        annotation_path = self.root / "Annotations" / f"{image_id}.xml"
+        image = Image.open(image_path).convert("RGB")
+        boxes_xyxy = self._load_car_boxes(annotation_path)
+        image, resize_info = _letterbox_image(image, self.image_size, interpolation=InterpolationMode.BILINEAR)
+        boxes_xyxy = _resize_xyxy_boxes(boxes_xyxy, resize_info, self.image_size)
+        boxes = _xyxy_to_normalized_cxcywh(boxes_xyxy, self.image_size)
+        image_tensor = TF.pil_to_tensor(image).float() / 255.0
+        target = {
+            "labels": torch.zeros(boxes.size(0), dtype=torch.long),
+            "boxes": boxes.to(dtype=torch.float32),
+        }
+        return image_tensor, target
+
+    def _load_car_boxes(self, annotation_path: Path) -> torch.Tensor:
+        root = ET.parse(annotation_path).getroot()
+        boxes: list[list[float]] = []
+        for obj in root.findall("object"):
+            name = obj.findtext("name", default="")
+            if name != "car":
+                continue
+            difficult = int(obj.findtext("difficult", default="0"))
+            if difficult and not self.keep_difficult:
+                continue
+            bbox = obj.find("bndbox")
+            if bbox is None:
+                continue
+            x0 = float(bbox.findtext("xmin", default="0")) - 1.0
+            y0 = float(bbox.findtext("ymin", default="0")) - 1.0
+            x1 = float(bbox.findtext("xmax", default="0"))
+            y1 = float(bbox.findtext("ymax", default="0"))
+            if x1 <= x0 or y1 <= y0:
+                continue
+            boxes.append([x0, y0, x1, y1])
+        if not boxes:
+            return torch.zeros((0, 4), dtype=torch.float32)
+        return torch.tensor(boxes, dtype=torch.float32)
+
+    def _annotation_has_car(self, annotation_path: Path) -> bool:
+        return bool(self._load_car_boxes(annotation_path).numel())
 
 
 def split_indices(length: int, train_fraction: float = 0.8, seed: int = 0) -> tuple[list[int], list[int]]:

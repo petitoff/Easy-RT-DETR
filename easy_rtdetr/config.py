@@ -12,6 +12,11 @@ class RTDETRv3Config:
     hidden_dim: int = 256
     num_feature_levels: int = 3
     feat_strides: tuple[int, ...] = (8, 16, 32)
+    hybrid_encoder_use_idx: tuple[int, ...] = (2,)
+    hybrid_encoder_layers: int = 1
+    hybrid_encoder_expansion: float = 1.0
+    hybrid_encoder_depth_mult: float = 1.0
+    hybrid_encoder_pe_temperature: float = 10000.0
     num_queries: int = 300
     num_decoder_layers: int = 6
     num_heads: int = 8

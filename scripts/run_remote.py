@@ -55,6 +55,21 @@ PRESETS: dict[str, dict[str, object]] = {
         "artifacts": ["artifacts/**/*.png"],
         "description": "Render prediction visualizations remotely.",
     },
+    "train-voc-car": {
+        "script": "scripts/train_voc_car.py",
+        "artifacts": ["artifacts/*.pt"],
+        "description": "Train Pascal VOC car-only model remotely.",
+    },
+    "eval-voc-car": {
+        "script": "scripts/eval_voc_car_checkpoint.py",
+        "artifacts": [],
+        "description": "Run Pascal VOC car-only checkpoint evaluation remotely.",
+    },
+    "visualize-voc-car": {
+        "script": "scripts/visualize_voc_car_predictions.py",
+        "artifacts": ["artifacts/**/*.png"],
+        "description": "Render Pascal VOC car-only visualizations remotely.",
+    },
 }
 UPLOAD_OK_MARKER = "__PYRUN_UPLOAD_OK__"
 DOWNLOAD_START_MARKER = "__PYRUN_DOWNLOAD_START__"
@@ -84,12 +99,18 @@ def resolve_env_value(env_values: dict[str, str], *keys: str, default: str | Non
 
 
 def infer_default_dataset_source(preset: str) -> Path | None:
-    if preset != "train-pennfudan":
+    if preset == "train-pennfudan":
+        candidates = [
+            PROJECT_ROOT / "data" / "PennFudanPed.zip",
+            PROJECT_ROOT / "data" / "PennFudanPed",
+        ]
+    elif preset == "train-voc-car":
+        candidates = [
+            PROJECT_ROOT / "data" / "VOCdevkit",
+            PROJECT_ROOT / "data" / "VOCtrainval_06-Nov-2007.tar",
+        ]
+    else:
         return None
-    candidates = [
-        PROJECT_ROOT / "data" / "PennFudanPed.zip",
-        PROJECT_ROOT / "data" / "PennFudanPed",
-    ]
     for candidate in candidates:
         if candidate.exists():
             return candidate

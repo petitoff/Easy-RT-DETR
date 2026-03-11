@@ -25,7 +25,19 @@ class RTDETRv3(nn.Module):
         self.register_buffer("pixel_mean", torch.tensor(config.image_mean).view(1, 3, 1, 1), persistent=False)
         self.register_buffer("pixel_std", torch.tensor(config.image_std).view(1, 3, 1, 1), persistent=False)
         self.backbone = TorchvisionResNetBackbone(config.backbone_name, pretrained=config.pretrained_backbone)
-        self.encoder = HybridEncoder(self.backbone.out_channels, config.hidden_dim)
+        self.encoder = HybridEncoder(
+            self.backbone.out_channels,
+            config.hidden_dim,
+            feat_strides=config.feat_strides,
+            use_encoder_idx=config.hybrid_encoder_use_idx,
+            num_encoder_layers=config.hybrid_encoder_layers,
+            encoder_num_heads=config.num_heads,
+            dim_feedforward=config.dim_feedforward,
+            dropout=config.dropout,
+            pe_temperature=config.hybrid_encoder_pe_temperature,
+            expansion=config.hybrid_encoder_expansion,
+            depth_mult=config.hybrid_encoder_depth_mult,
+        )
         self.query_selection = QuerySelection(
             hidden_dim=config.hidden_dim,
             num_classes=config.num_classes,
