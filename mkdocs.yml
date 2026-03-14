@@ -1,0 +1,16 @@
+site_name: Easy-RT-DETR Docs
+site_description: Dokumentacja rozwoju Easy-RT-DETR i statusu implementacji RT-DETRv3 w PyTorch.
+repo_url: https://github.com/petitoff/Easy-RT-DETR
+site_url: https://petitoff.github.io/Easy-RT-DETR/
+theme:
+  name: mkdocs
+nav:
+  - Start: index.md
+  - Architektura: architecture.md
+  - Eksperymenty i Wyniki: experiments.md
+  - Zdalny Trening GPU: remote-training.md
+  - Status i Roadmapa: status.md
+markdown_extensions:
+  - tables
+  - toc:
+      permalink: true

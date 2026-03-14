@@ -19,6 +19,9 @@ dependencies = [
 dev = [
   "pytest>=8.0",
 ]
+docs = [
+  "mkdocs>=1.6",
+]
 
 [tool.setuptools.packages.find]
 include = ["easy_rtdetr*"]
