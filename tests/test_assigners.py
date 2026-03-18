@@ -22,3 +22,22 @@ def test_assigners_handle_empty_targets():
     task_result = task_aligned(pred_scores, pred_boxes, anchor_points, gt_labels, gt_boxes, num_classes=3)
     assert task_result.labels.shape == (2, 2)
     assert task_result.labels[0].eq(3).all()
+
+
+def test_assigners_handle_mixed_precision_boxes():
+    anchor_boxes = torch.tensor([[0.0, 0.0, 16.0, 16.0], [16.0, 16.0, 32.0, 32.0]], dtype=torch.float16)
+    anchor_points = torch.tensor([[8.0, 8.0], [24.0, 24.0]], dtype=torch.float16)
+    pred_scores = torch.rand(1, 2, 3, dtype=torch.float16)
+    pred_boxes = anchor_boxes.unsqueeze(0)
+    gt_labels = [torch.tensor([1])]
+    gt_boxes = [torch.tensor([[16.0, 16.0, 32.0, 32.0]], dtype=torch.float32)]
+
+    atss = ATSSAssigner(topk=1)
+    atss_result = atss(anchor_boxes, [1, 1], gt_labels, gt_boxes, num_classes=3, pred_boxes=pred_boxes)
+    assert atss_result.boxes.dtype == anchor_boxes.dtype
+    assert atss_result.scores.dtype == anchor_boxes.dtype
+
+    task_aligned = TaskAlignedAssigner(topk=1)
+    task_result = task_aligned(pred_scores, pred_boxes, anchor_points, gt_labels, gt_boxes, num_classes=3)
+    assert task_result.boxes.dtype == pred_scores.dtype
+    assert task_result.scores.dtype == pred_scores.dtype

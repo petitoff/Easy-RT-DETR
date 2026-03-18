@@ -11,6 +11,11 @@ class RTDETRv3Config:
     pretrained_backbone: bool = False
     hidden_dim: int = 256
     num_feature_levels: int = 3
+    use_input_proj: bool = True
+    position_embed_type: str = "sine"
+    eval_size: tuple[int, int] | None = None
+    num_encoder_points: int = 4
+    transformer_encoder_layers: int = 1
     feat_strides: tuple[int, ...] = (8, 16, 32)
     hybrid_encoder_use_idx: tuple[int, ...] = (2,)
     hybrid_encoder_layers: int = 1

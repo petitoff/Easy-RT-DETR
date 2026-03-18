@@ -6,6 +6,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from .attention import MultiScaleDeformableAttention
+
 
 @dataclass
 class EncoderOutput:
@@ -13,6 +15,8 @@ class EncoderOutput:
     memory: torch.Tensor
     spatial_shapes: torch.Tensor
     level_start_index: torch.Tensor
+    valid_ratios: torch.Tensor
+    mask_flatten: torch.Tensor
 
 
 class ConvNormAct(nn.Module):
@@ -127,33 +131,189 @@ class TransformerEncoder(nn.Module):
         return src
 
 
+class DeformableTransformerEncoderLayer(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int,
+        dropout: float,
+        num_levels: int,
+        num_points: int,
+    ) -> None:
+        super().__init__()
+        self.self_attn = MultiScaleDeformableAttention(d_model, nhead, num_levels, num_points)
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.activation = nn.GELU()
+        self._reset_parameters()
+
+    def _reset_parameters(self) -> None:
+        nn.init.xavier_uniform_(self.linear1.weight)
+        nn.init.constant_(self.linear1.bias, 0.0)
+        nn.init.xavier_uniform_(self.linear2.weight)
+        nn.init.constant_(self.linear2.bias, 0.0)
+
+    @staticmethod
+    def with_pos_embed(tensor: torch.Tensor, pos_embed: torch.Tensor | None) -> torch.Tensor:
+        return tensor if pos_embed is None else tensor + pos_embed
+
+    def forward_ffn(self, src: torch.Tensor) -> torch.Tensor:
+        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+        src = src + self.dropout2(src2)
+        return self.norm2(src)
+
+    def forward(
+        self,
+        src: torch.Tensor,
+        reference_points: torch.Tensor,
+        spatial_shapes: torch.Tensor,
+        level_start_index: torch.Tensor,
+        src_mask: torch.Tensor | None = None,
+        query_pos_embed: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        src2 = self.self_attn(
+            self.with_pos_embed(src, query_pos_embed),
+            reference_points,
+            src,
+            spatial_shapes,
+            level_start_index=level_start_index,
+            value_mask=src_mask,
+        )
+        src = src + self.dropout1(src2)
+        src = self.norm1(src)
+        return self.forward_ffn(src)
+
+
+class DeformableTransformerEncoder(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int,
+        num_layers: int,
+        dropout: float,
+        num_levels: int,
+        num_points: int,
+    ) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [
+                DeformableTransformerEncoderLayer(
+                    d_model=d_model,
+                    nhead=nhead,
+                    dim_feedforward=dim_feedforward,
+                    dropout=dropout,
+                    num_levels=num_levels,
+                    num_points=num_points,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+
+    @staticmethod
+    def get_reference_points(
+        spatial_shapes: torch.Tensor,
+        valid_ratios: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+        offset: float = 0.5,
+    ) -> torch.Tensor:
+        valid_ratios = valid_ratios.unsqueeze(1)
+        reference_points = []
+        for level, (height, width) in enumerate(spatial_shapes.tolist()):
+            ref_y, ref_x = torch.meshgrid(
+                torch.arange(height, device=device, dtype=dtype) + offset,
+                torch.arange(width, device=device, dtype=dtype) + offset,
+                indexing="ij",
+            )
+            ref_y = ref_y.reshape(1, -1) / (valid_ratios[:, :, level, 1] * height)
+            ref_x = ref_x.reshape(1, -1) / (valid_ratios[:, :, level, 0] * width)
+            reference_points.append(torch.stack((ref_x, ref_y), dim=-1))
+        reference_points = torch.cat(reference_points, dim=1).unsqueeze(2)
+        return reference_points * valid_ratios
+
+    def forward(
+        self,
+        feat: torch.Tensor,
+        spatial_shapes: torch.Tensor,
+        level_start_index: torch.Tensor,
+        feat_mask: torch.Tensor | None = None,
+        query_pos_embed: torch.Tensor | None = None,
+        valid_ratios: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if valid_ratios is None:
+            valid_ratios = torch.ones(
+                feat.size(0),
+                spatial_shapes.size(0),
+                2,
+                device=feat.device,
+                dtype=feat.dtype,
+            )
+        reference_points = self.get_reference_points(
+            spatial_shapes=spatial_shapes,
+            valid_ratios=valid_ratios,
+            device=feat.device,
+            dtype=feat.dtype,
+        )
+        for layer in self.layers:
+            feat = layer(
+                feat,
+                reference_points,
+                spatial_shapes,
+                level_start_index,
+                src_mask=feat_mask,
+                query_pos_embed=query_pos_embed,
+            )
+        return feat
+
+
 class HybridEncoder(nn.Module):
     def __init__(
         self,
         in_channels: list[int],
         hidden_dim: int,
+        num_feature_levels: int = 3,
         feat_strides: tuple[int, ...] = (8, 16, 32),
         use_encoder_idx: tuple[int, ...] = (2,),
         num_encoder_layers: int = 1,
+        transformer_encoder_layers: int = 1,
         encoder_num_heads: int = 8,
+        num_encoder_points: int = 4,
         dim_feedforward: int = 1024,
         dropout: float = 0.0,
         pe_temperature: float = 10000.0,
         expansion: float = 1.0,
         depth_mult: float = 1.0,
+        use_input_proj: bool = True,
+        position_embed_type: str = "sine",
+        eval_size: tuple[int, int] | None = None,
     ) -> None:
         super().__init__()
         self.in_channels = list(in_channels)
         self.hidden_dim = hidden_dim
+        self.num_feature_levels = num_feature_levels
         self.feat_strides = tuple(feat_strides)
         self.use_encoder_idx = tuple(sorted(use_encoder_idx))
         self.num_encoder_layers = num_encoder_layers
+        self.transformer_encoder_layers = transformer_encoder_layers
+        self.num_encoder_points = num_encoder_points
         self.pe_temperature = pe_temperature
+        self.use_input_proj = use_input_proj
+        self.position_embed_type = position_embed_type
+        self.eval_size = eval_size
 
         if len(self.in_channels) != len(self.feat_strides):
             raise ValueError("Feature strides must match encoder input features.")
         if any(index < 0 or index >= len(self.in_channels) for index in self.use_encoder_idx):
             raise ValueError("use_encoder_idx contains an invalid feature level.")
+        if self.position_embed_type != "sine":
+            raise ValueError("Only sine position embedding is currently supported.")
 
         rep_depth = max(1, round(3 * depth_mult))
 
@@ -198,6 +358,37 @@ class HybridEncoder(nn.Module):
                 for _ in range(len(self.in_channels) - 1)
             ]
         )
+        self.transformer_input_proj = nn.ModuleList()
+        for _ in range(len(self.in_channels)):
+            self.transformer_input_proj.append(
+                nn.Sequential(
+                    nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1, bias=False),
+                    nn.BatchNorm2d(hidden_dim),
+                )
+            )
+        for _ in range(self.num_feature_levels - len(self.in_channels)):
+            self.transformer_input_proj.append(
+                nn.Sequential(
+                    nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, stride=2, padding=1, bias=False),
+                    nn.BatchNorm2d(hidden_dim),
+                )
+            )
+        self.level_embed = nn.Embedding(self.num_feature_levels, hidden_dim)
+        self.deformable_encoder = DeformableTransformerEncoder(
+            d_model=hidden_dim,
+            nhead=encoder_num_heads,
+            dim_feedforward=dim_feedforward,
+            num_layers=transformer_encoder_layers,
+            dropout=dropout,
+            num_levels=self.num_feature_levels,
+            num_points=num_encoder_points,
+        )
+        self._reset_parameters()
+
+    def _reset_parameters(self) -> None:
+        nn.init.normal_(self.level_embed.weight)
+        for module in self.transformer_input_proj:
+            nn.init.xavier_uniform_(module[0].weight)
 
     @staticmethod
     def build_2d_sincos_position_embedding(
@@ -241,7 +432,75 @@ class HybridEncoder(nn.Module):
             projected[feature_index] = encoded.transpose(1, 2).reshape(batch_size, self.hidden_dim, height, width)
         return projected
 
-    def forward(self, features: list[torch.Tensor]) -> EncoderOutput:
+    @staticmethod
+    def _get_valid_ratio(mask: torch.Tensor) -> torch.Tensor:
+        _, height, width = mask.shape
+        valid_h = mask[:, :, 0].float().sum(dim=1)
+        valid_w = mask[:, 0, :].float().sum(dim=1)
+        ratio_h = valid_h / height
+        ratio_w = valid_w / width
+        return torch.stack((ratio_w, ratio_h), dim=-1)
+
+    def _get_transformer_inputs(
+        self,
+        features: list[torch.Tensor],
+        pad_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.use_input_proj:
+            projected = [self.transformer_input_proj[index](feature) for index, feature in enumerate(features)]
+            if self.num_feature_levels > len(projected):
+                for index in range(len(projected), self.num_feature_levels):
+                    source = features[-1] if index == len(features) else projected[-1]
+                    projected.append(self.transformer_input_proj[index](source))
+        else:
+            projected = features
+
+        feat_flatten = []
+        mask_flatten = []
+        lvl_pos_embed_flatten = []
+        spatial_shapes = []
+        valid_ratios = []
+        for index, feature in enumerate(projected):
+            batch_size, _, height, width = feature.shape
+            spatial_shapes.append((height, width))
+            feat_flatten.append(feature.flatten(2).transpose(1, 2))
+            if pad_mask is not None:
+                level_mask = F.interpolate(
+                    pad_mask.unsqueeze(1).float(),
+                    size=(height, width),
+                    mode="nearest",
+                ).squeeze(1) > 0.5
+            else:
+                level_mask = torch.ones(batch_size, height, width, device=feature.device, dtype=torch.bool)
+            valid_ratios.append(self._get_valid_ratio(level_mask))
+            level_pos_embed = self.build_2d_sincos_position_embedding(
+                width=width,
+                height=height,
+                embed_dim=self.hidden_dim,
+                temperature=self.pe_temperature,
+                device=feature.device,
+                dtype=feature.dtype,
+            )
+            lvl_pos_embed_flatten.append(level_pos_embed + self.level_embed.weight[index].view(1, 1, -1))
+            mask_flatten.append(level_mask.flatten(1))
+
+        spatial_shapes_tensor = torch.tensor(spatial_shapes, device=projected[0].device, dtype=torch.long)
+        level_start_index = torch.cat(
+            (
+                torch.zeros(1, device=projected[0].device, dtype=torch.long),
+                spatial_shapes_tensor.prod(1).cumsum(0)[:-1],
+            )
+        )
+        return (
+            torch.cat(feat_flatten, dim=1),
+            spatial_shapes_tensor,
+            level_start_index,
+            torch.cat(mask_flatten, dim=1),
+            torch.cat(lvl_pos_embed_flatten, dim=1),
+            torch.stack(valid_ratios, dim=1),
+        )
+
+    def forward(self, features: list[torch.Tensor], pad_mask: torch.Tensor | None = None) -> EncoderOutput:
         projected = [proj(feat) for proj, feat in zip(self.input_proj, features)]
         projected = self._apply_encoder(projected)
 
@@ -261,19 +520,28 @@ class HybridEncoder(nn.Module):
             down = self.downsample_convs[index](pan_features[-1])
             fused = torch.cat([down, inner_outs[index + 1]], dim=1)
             pan_features.append(self.pan_blocks[index](fused))
-
-        flattened = []
-        spatial_shapes = []
-        level_start_index = [0]
-        for feature in pan_features:
-            _, _, height, width = feature.shape
-            spatial_shapes.append((height, width))
-            flattened.append(feature.flatten(2).transpose(1, 2))
-            level_start_index.append(level_start_index[-1] + height * width)
+        (
+            feat_flatten,
+            spatial_shapes,
+            level_start_index,
+            mask_flatten,
+            lvl_pos_embed_flatten,
+            valid_ratios,
+        ) = self._get_transformer_inputs(pan_features, pad_mask=pad_mask)
+        memory = self.deformable_encoder(
+            feat_flatten,
+            spatial_shapes,
+            level_start_index,
+            feat_mask=mask_flatten,
+            query_pos_embed=lvl_pos_embed_flatten,
+            valid_ratios=valid_ratios,
+        )
 
         return EncoderOutput(
             features=pan_features,
-            memory=torch.cat(flattened, dim=1),
-            spatial_shapes=torch.tensor(spatial_shapes, device=pan_features[0].device, dtype=torch.long),
-            level_start_index=torch.tensor(level_start_index[:-1], device=pan_features[0].device, dtype=torch.long),
+            memory=memory,
+            spatial_shapes=spatial_shapes,
+            level_start_index=level_start_index,
+            valid_ratios=valid_ratios,
+            mask_flatten=mask_flatten,
         )

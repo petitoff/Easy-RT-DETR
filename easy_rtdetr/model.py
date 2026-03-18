@@ -28,15 +28,21 @@ class RTDETRv3(nn.Module):
         self.encoder = HybridEncoder(
             self.backbone.out_channels,
             config.hidden_dim,
+            num_feature_levels=config.num_feature_levels,
             feat_strides=config.feat_strides,
             use_encoder_idx=config.hybrid_encoder_use_idx,
             num_encoder_layers=config.hybrid_encoder_layers,
+            transformer_encoder_layers=config.transformer_encoder_layers,
             encoder_num_heads=config.num_heads,
+            num_encoder_points=config.num_encoder_points,
             dim_feedforward=config.dim_feedforward,
             dropout=config.dropout,
             pe_temperature=config.hybrid_encoder_pe_temperature,
             expansion=config.hybrid_encoder_expansion,
             depth_mult=config.hybrid_encoder_depth_mult,
+            use_input_proj=config.use_input_proj,
+            position_embed_type=config.position_embed_type,
+            eval_size=config.eval_size,
         )
         self.query_selection = QuerySelection(
             hidden_dim=config.hidden_dim,
@@ -113,9 +119,15 @@ class RTDETRv3(nn.Module):
     ) -> dict[str, torch.Tensor] | list[dict[str, torch.Tensor]]:
         images = batch_images(images)
         images = (images - self.pixel_mean) / self.pixel_std
+        pad_mask = torch.ones(images.size(0), images.size(2), images.size(3), device=images.device, dtype=torch.bool)
         features = self.backbone(images)
-        encoder_output = self.encoder(features)
-        query_selection = self.query_selection(encoder_output.memory, encoder_output.spatial_shapes, targets=targets)
+        encoder_output = self.encoder(features, pad_mask=pad_mask)
+        query_selection = self.query_selection(
+            encoder_output.memory,
+            encoder_output.spatial_shapes,
+            memory_mask=encoder_output.mask_flatten,
+            targets=targets,
+        )
         attn_mask = build_group_attention_mask(
             query_selection.groups,
             keep_prob=self.config.perturbation_keep_prob,
@@ -127,9 +139,12 @@ class RTDETRv3(nn.Module):
             reference_points_unact=query_selection.reference_points_unact,
             memory=query_selection.memory,
             spatial_shapes=encoder_output.spatial_shapes,
+            level_start_index=encoder_output.level_start_index,
+            valid_ratios=encoder_output.valid_ratios,
             class_heads=self.decoder_heads.class_heads,
             box_heads=self.decoder_heads.box_heads,
             attn_mask=attn_mask,
+            memory_mask=query_selection.memory_mask,
         )
 
         if not self.training:

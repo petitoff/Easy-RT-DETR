@@ -7,7 +7,7 @@ from torch import nn
 
 from .attention import MaskedSelfAttention, MultiScaleDeformableAttention
 from .heads import MLP
-from .utils import inverse_sigmoid
+from .utils import get_sine_pos_embed, inverse_sigmoid
 
 
 @dataclass
@@ -55,7 +55,9 @@ class RTDETRDecoderLayer(nn.Module):
         reference_points: torch.Tensor,
         memory: torch.Tensor,
         spatial_shapes: torch.Tensor,
+        level_start_index: torch.Tensor,
         attn_mask: torch.Tensor | None,
+        memory_mask: torch.Tensor | None,
         query_pos: torch.Tensor,
     ) -> torch.Tensor:
         query = target + query_pos
@@ -63,7 +65,16 @@ class RTDETRDecoderLayer(nn.Module):
         query = target + query_pos
         target = self.norm2(
             target
-            + self.dropout(self.cross_attn(query=query, reference_points=reference_points, value=memory, spatial_shapes=spatial_shapes))
+            + self.dropout(
+                self.cross_attn(
+                    query=query,
+                    reference_points=reference_points,
+                    value=memory,
+                    spatial_shapes=spatial_shapes,
+                    level_start_index=level_start_index,
+                    value_mask=memory_mask,
+                )
+            )
         )
         ffn = self.linear2(self.dropout(torch.relu(self.linear1(target))))
         return self.norm3(target + self.dropout(ffn))
@@ -82,13 +93,15 @@ class RTDETRDecoder(nn.Module):
         query_pos_head_inv_sig: bool = False,
     ) -> None:
         super().__init__()
+        self.hidden_dim = hidden_dim
         self.layers = nn.ModuleList(
             [
                 RTDETRDecoderLayer(hidden_dim, num_heads, dim_feedforward, dropout, num_levels, num_points)
                 for _ in range(num_layers)
             ]
         )
-        self.query_pos_head = MLP(4, hidden_dim * 2, hidden_dim, num_layers=2)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.query_pos_head = MLP(hidden_dim * 2, hidden_dim, hidden_dim, num_layers=2)
         self.query_pos_head_inv_sig = query_pos_head_inv_sig
 
     def forward(
@@ -97,21 +110,44 @@ class RTDETRDecoder(nn.Module):
         reference_points_unact: torch.Tensor,
         memory: torch.Tensor,
         spatial_shapes: torch.Tensor,
+        level_start_index: torch.Tensor,
+        valid_ratios: torch.Tensor | None,
         class_heads: nn.ModuleList,
         box_heads: nn.ModuleList,
         attn_mask: torch.Tensor | None = None,
+        memory_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         output = target
         reference_points = reference_points_unact.sigmoid()
+        if valid_ratios is None:
+            valid_ratios = torch.ones(
+                memory.size(0),
+                spatial_shapes.size(0),
+                2,
+                device=memory.device,
+                dtype=memory.dtype,
+            )
         boxes = []
         logits = []
         for layer_id, layer in enumerate(self.layers):
-            query_pos_input = inverse_sigmoid(reference_points) if self.query_pos_head_inv_sig else reference_points
-            query_pos = self.query_pos_head(query_pos_input)
-            reference_points_input = reference_points.unsqueeze(2)
-            output = layer(output, reference_points_input, memory, spatial_shapes, attn_mask, query_pos)
-            pred_boxes = (box_heads[layer_id](output) + inverse_sigmoid(reference_points)).sigmoid()
-            pred_logits = class_heads[layer_id](output)
+            reference_points_input = reference_points.unsqueeze(2) * valid_ratios.repeat(1, 1, 2).unsqueeze(1)
+            query_pos_source = reference_points_input[..., 0, :]
+            if self.query_pos_head_inv_sig:
+                query_pos_source = inverse_sigmoid(query_pos_source)
+            query_pos = self.query_pos_head(get_sine_pos_embed(query_pos_source, self.hidden_dim // 2))
+            output = layer(
+                output,
+                reference_points_input,
+                memory,
+                spatial_shapes,
+                level_start_index,
+                attn_mask,
+                memory_mask,
+                query_pos,
+            )
+            norm_output = self.norm(output)
+            pred_boxes = (box_heads[layer_id](norm_output) + inverse_sigmoid(reference_points)).sigmoid()
+            pred_logits = class_heads[layer_id](norm_output)
             boxes.append(pred_boxes)
             logits.append(pred_logits)
             reference_points = pred_boxes.detach() if self.training else pred_boxes

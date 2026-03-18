@@ -56,8 +56,12 @@ class MultiScaleDeformableAttention(nn.Module):
         reference_points: torch.Tensor,
         value: torch.Tensor,
         spatial_shapes: torch.Tensor,
+        level_start_index: torch.Tensor | None = None,
+        value_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size, len_q, _ = query.shape
+        if value_mask is not None:
+            value = value.masked_fill(~value_mask.unsqueeze(-1), 0.0)
         value = self.value_proj(value).view(batch_size, -1, self.num_heads, self.head_dim)
         sampling_offsets = self.sampling_offsets(query).view(
             batch_size, len_q, self.num_heads, self.num_levels, self.num_points, 2

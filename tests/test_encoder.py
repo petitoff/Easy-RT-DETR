@@ -15,6 +15,9 @@ def test_encoder_flattened_memory():
     output = encoder(features)
     assert output.memory.shape == (2, 32 * 32 + 16 * 16 + 8 * 8, 256)
     assert output.spatial_shapes.shape == (3, 2)
+    assert output.level_start_index.tolist() == [0, 32 * 32, 32 * 32 + 16 * 16]
+    assert output.valid_ratios.shape == (2, 3, 2)
+    assert output.mask_flatten.shape == (2, 32 * 32 + 16 * 16 + 8 * 8)
 
 
 def test_encoder_with_transformer_stage_and_csp_fusion():
@@ -36,3 +39,17 @@ def test_encoder_with_transformer_stage_and_csp_fusion():
     assert len(output.features) == 3
     assert all(feature.shape[1] == 128 for feature in output.features)
     assert output.level_start_index.tolist() == [0, 32 * 32, 32 * 32 + 16 * 16]
+
+
+def test_encoder_respects_pad_mask_for_valid_ratios():
+    encoder = HybridEncoder([64, 128, 256], hidden_dim=128, transformer_encoder_layers=1)
+    features = [
+        torch.randn(1, 64, 32, 32),
+        torch.randn(1, 128, 16, 16),
+        torch.randn(1, 256, 8, 8),
+    ]
+    pad_mask = torch.ones(1, 32, 32, dtype=torch.bool)
+    pad_mask[:, :, 24:] = False
+    output = encoder(features, pad_mask=pad_mask)
+    assert output.valid_ratios[0, 0, 0].item() == pytest.approx(24 / 32, rel=1e-4)
+    assert output.valid_ratios[0, 0, 1].item() == pytest.approx(1.0, rel=1e-4)

@@ -236,37 +236,44 @@ class AuxiliaryDenseCriterion(nn.Module):
         num_anchors_list = aux_outputs.num_anchors_list
 
         height, width = image_size
-        scale = pred_boxes.new_tensor([width, height, width, height])
         gt_labels = [target["labels"].to(device=pred_boxes.device, dtype=torch.long) for target in targets]
-        gt_boxes = [box_cxcywh_to_xyxy(target["boxes"].to(pred_boxes.device)) * scale for target in targets]
+        assignment_device_type = pred_boxes.device.type
+        with torch.autocast(device_type=assignment_device_type, enabled=False):
+            scale = torch.tensor([width, height, width, height], device=pred_boxes.device, dtype=torch.float32)
+            gt_boxes = [box_cxcywh_to_xyxy(target["boxes"].to(pred_boxes.device, dtype=torch.float32)) * scale for target in targets]
+            if epoch is not None and epoch <= self.static_assigner_epoch:
+                assignment = self.static_assigner(
+                    anchor_boxes=anchor_boxes.float(),
+                    num_anchors_list=num_anchors_list,
+                    gt_labels=gt_labels,
+                    gt_boxes=gt_boxes,
+                    num_classes=self.num_classes,
+                    pred_boxes=pred_boxes.detach().float(),
+                )
+            else:
+                assignment = self.task_aligned_assigner(
+                    pred_scores=pred_scores.detach().float(),
+                    pred_boxes=pred_boxes.detach().float(),
+                    anchor_points=anchor_points.float(),
+                    gt_labels=gt_labels,
+                    gt_boxes=gt_boxes,
+                    num_classes=self.num_classes,
+                )
 
-        if epoch is not None and epoch <= self.static_assigner_epoch:
-            assignment = self.static_assigner(
-                anchor_boxes=anchor_boxes,
-                num_anchors_list=num_anchors_list,
-                gt_labels=gt_labels,
-                gt_boxes=gt_boxes,
-                num_classes=self.num_classes,
-                pred_boxes=pred_boxes.detach(),
-            )
-        else:
-            assignment = self.task_aligned_assigner(
-                pred_scores=pred_scores.detach(),
-                pred_boxes=pred_boxes.detach(),
-                anchor_points=anchor_points,
-                gt_labels=gt_labels,
-                gt_boxes=gt_boxes,
-                num_classes=self.num_classes,
-            )
+        assignment.boxes = assignment.boxes.to(pred_boxes.dtype)
+        assignment.scores = assignment.scores.to(pred_scores.dtype)
+        anchor_points = anchor_points.to(pred_boxes.dtype)
+        stride_tensor = stride_tensor.to(pred_boxes.dtype)
 
         if self.use_varifocal_loss:
             one_hot = F.one_hot(assignment.labels.clamp(max=self.num_classes), self.num_classes + 1)[..., : self.num_classes]
             loss_cls = self._varifocal_loss(pred_scores, assignment.scores, one_hot.to(pred_scores.dtype))
         else:
-            target_scores = assignment.scores
-            loss_cls = F.binary_cross_entropy(pred_scores, target_scores, reduction="sum")
+            with torch.autocast(device_type=pred_scores.device.type, enabled=False):
+                target_scores = assignment.scores.float()
+                loss_cls = F.binary_cross_entropy(pred_scores.float(), target_scores, reduction="sum")
 
-        assigned_scores_sum = assignment.scores.sum().clamp(min=1.0)
+        assigned_scores_sum = assignment.scores.float().sum().clamp(min=1.0)
         loss_cls = self.loss_weight_class * (loss_cls / assigned_scores_sum)
 
         positive_mask = assignment.labels != self.num_classes
@@ -303,8 +310,12 @@ class AuxiliaryDenseCriterion(nn.Module):
         alpha: float = 0.75,
         gamma: float = 2.0,
     ) -> torch.Tensor:
-        weight = alpha * pred_score.detach().pow(gamma) * (1.0 - label) + gt_score * label
-        return F.binary_cross_entropy(pred_score, gt_score, weight=weight, reduction="sum")
+        with torch.autocast(device_type=pred_score.device.type, enabled=False):
+            pred_score = pred_score.float()
+            gt_score = gt_score.float()
+            label = label.float()
+            weight = alpha * pred_score.detach().pow(gamma) * (1.0 - label) + gt_score * label
+            return F.binary_cross_entropy(pred_score, gt_score, weight=weight, reduction="sum")
 
     def _distribution_focal_loss(self, pred_dist: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         target_left = target.floor().long()

@@ -57,14 +57,17 @@ class ATSSAssigner:
         batch_size = len(gt_labels)
         num_anchors = anchor_boxes.size(0)
         result = _empty_assignment(batch_size, num_anchors, num_classes, anchor_boxes.device, anchor_boxes.dtype)
-        anchor_centers = (anchor_boxes[:, :2] + anchor_boxes[:, 2:]) / 2.0
+        anchor_boxes_float = anchor_boxes.float()
+        anchor_centers = (anchor_boxes_float[:, :2] + anchor_boxes_float[:, 2:]) / 2.0
+        pred_boxes_float = pred_boxes.float() if pred_boxes is not None else None
 
         for batch_id, (labels, boxes) in enumerate(zip(gt_labels, gt_boxes)):
             if labels.numel() == 0:
                 continue
 
-            ious, _ = box_iou(boxes, anchor_boxes)
-            gt_centers = (boxes[:, :2] + boxes[:, 2:]) / 2.0
+            boxes_float = boxes.float()
+            ious, _ = box_iou(boxes_float, anchor_boxes_float)
+            gt_centers = (boxes_float[:, :2] + boxes_float[:, 2:]) / 2.0
             distances = torch.cdist(gt_centers, anchor_centers)
             candidate_mask = torch.zeros_like(ious, dtype=torch.bool)
             candidate_indices: list[torch.Tensor] = []
@@ -81,7 +84,7 @@ class ATSSAssigner:
             candidate_ious = torch.gather(ious, 1, flat_candidates)
             thresholds = candidate_ious.mean(dim=1) + candidate_ious.std(dim=1, unbiased=False)
             positive_mask = candidate_mask & (ious >= thresholds.unsqueeze(1))
-            positive_mask &= _points_inside_boxes(anchor_centers, boxes)
+            positive_mask &= _points_inside_boxes(anchor_centers, boxes_float)
 
             if positive_mask.sum() == 0:
                 best_anchor = ious.argmax(dim=1, keepdim=True)
@@ -96,14 +99,14 @@ class ATSSAssigner:
             pos_idx = positive_anchors.nonzero(as_tuple=False).squeeze(1)
             matched_gt = best_gt_per_anchor[pos_idx]
             result.labels[batch_id, pos_idx] = labels[matched_gt]
-            result.boxes[batch_id, pos_idx] = boxes[matched_gt]
+            result.boxes[batch_id, pos_idx] = boxes[matched_gt].to(result.boxes.dtype)
 
-            one_hot = F.one_hot(labels[matched_gt], num_classes=num_classes).to(anchor_boxes.dtype)
-            if pred_boxes is not None:
-                pred_ious, _ = box_iou(boxes, pred_boxes[batch_id])
+            one_hot = F.one_hot(labels[matched_gt], num_classes=num_classes).to(result.scores.dtype)
+            if pred_boxes_float is not None:
+                pred_ious, _ = box_iou(boxes_float, pred_boxes_float[batch_id])
                 matched_scores = pred_ious[matched_gt, pos_idx]
                 one_hot = one_hot * matched_scores.unsqueeze(1)
-            result.scores[batch_id, pos_idx] = one_hot
+            result.scores[batch_id, pos_idx] = one_hot.to(result.scores.dtype)
 
         return result
 
@@ -127,15 +130,19 @@ class TaskAlignedAssigner:
     ) -> AssignmentResult:
         batch_size, num_anchors, _ = pred_scores.shape
         result = _empty_assignment(batch_size, num_anchors, num_classes, pred_scores.device, pred_scores.dtype)
+        pred_scores_float = pred_scores.float()
+        pred_boxes_float = pred_boxes.float()
+        anchor_points_float = anchor_points.float()
 
         for batch_id, (labels, boxes) in enumerate(zip(gt_labels, gt_boxes)):
             if labels.numel() == 0:
                 continue
 
-            ious, _ = box_iou(boxes, pred_boxes[batch_id])
-            cls_scores = pred_scores[batch_id][:, labels].transpose(0, 1)
+            boxes_float = boxes.float()
+            ious, _ = box_iou(boxes_float, pred_boxes_float[batch_id])
+            cls_scores = pred_scores_float[batch_id][:, labels].transpose(0, 1)
             alignment = cls_scores.pow(self.alpha) * ious.pow(self.beta)
-            in_gts = _points_inside_boxes(anchor_points, boxes)
+            in_gts = _points_inside_boxes(anchor_points_float, boxes_float)
 
             topk = min(self.topk, num_anchors)
             topk_idx = (alignment * in_gts.float()).topk(topk, dim=1).indices
@@ -162,10 +169,10 @@ class TaskAlignedAssigner:
             pos_idx = positive_anchors.nonzero(as_tuple=False).squeeze(1)
             matched_gt = best_gt_per_anchor[pos_idx]
             result.labels[batch_id, pos_idx] = labels[matched_gt]
-            result.boxes[batch_id, pos_idx] = boxes[matched_gt]
+            result.boxes[batch_id, pos_idx] = boxes[matched_gt].to(result.boxes.dtype)
 
             one_hot = F.one_hot(labels[matched_gt], num_classes=num_classes).to(pred_scores.dtype)
             matched_scores = normalized[matched_gt, pos_idx]
-            result.scores[batch_id, pos_idx] = one_hot * matched_scores.unsqueeze(1)
+            result.scores[batch_id, pos_idx] = (one_hot * matched_scores.unsqueeze(1)).to(result.scores.dtype)
 
         return result

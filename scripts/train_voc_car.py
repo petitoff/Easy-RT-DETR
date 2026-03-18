@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -12,21 +13,32 @@ from easy_rtdetr.datasets import PascalVOCCarDataset, detection_collate_fn, spli
 from easy_rtdetr.model import RTDETRv3
 
 
-def build_model(pretrained_backbone: bool = True) -> RTDETRv3:
+def parse_bool(value: str) -> bool:
+    lowered = value.strip().lower()
+    if lowered in {"1", "true", "yes", "y", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
+
+
+def build_model(args: argparse.Namespace) -> RTDETRv3:
     config = RTDETRv3Config(
         num_classes=1,
-        backbone_name="resnet18",
-        pretrained_backbone=pretrained_backbone,
-        hidden_dim=96,
-        num_queries=80,
-        num_decoder_layers=3,
-        num_heads=4,
-        num_decoder_points=4,
-        dim_feedforward=192,
+        backbone_name=args.backbone_name,
+        pretrained_backbone=args.pretrained_backbone,
+        hidden_dim=args.hidden_dim,
+        num_feature_levels=args.num_feature_levels,
+        transformer_encoder_layers=args.transformer_encoder_layers,
+        num_queries=args.num_queries,
+        num_decoder_layers=args.num_decoder_layers,
+        num_heads=args.num_heads,
+        num_decoder_points=args.num_decoder_points,
+        dim_feedforward=args.dim_feedforward,
         num_o2o_groups=1,
         perturbation_keep_prob=0.9,
         o2m_branch=True,
-        num_queries_o2m=80,
+        num_queries_o2m=args.num_queries_o2m,
         o2m_duplicates=2,
         aux_static_assigner_epoch=4,
         inference_topk=20,
@@ -71,11 +83,14 @@ def make_dataloaders(args: argparse.Namespace) -> tuple[DataLoader, PascalVOCCar
         indices=eval_indices,
         positive_only=args.positive_only_train if args.positive_only_eval is None else args.positive_only_eval,
     )
+    pin_memory = args.pin_memory and args.device in {"auto", "cuda"}
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=0,
+        num_workers=args.num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=args.num_workers > 0,
         collate_fn=detection_collate_fn,
     )
     return train_loader, eval_dataset
@@ -83,14 +98,38 @@ def make_dataloaders(args: argparse.Namespace) -> tuple[DataLoader, PascalVOCCar
 
 def train(args: argparse.Namespace) -> None:
     device = resolve_device(args.device)
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
     torch.manual_seed(args.seed)
     train_loader, eval_dataset = make_dataloaders(args)
-    model = build_model(pretrained_backbone=args.pretrained_backbone).to(device)
+    model = build_model(args).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    use_amp = args.amp and device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     print(f"Training on {device.type.upper()} with Pascal VOC car-only detection")
     print(f"data_root={args.data_root}")
     print(f"epochs={args.epochs} batch_size={args.batch_size} image_size={args.image_size}")
+    print(
+        "model_cfg="
+        f"backbone={args.backbone_name} "
+        f"hidden_dim={args.hidden_dim} "
+        f"num_feature_levels={args.num_feature_levels} "
+        f"transformer_encoder_layers={args.transformer_encoder_layers} "
+        f"num_decoder_layers={args.num_decoder_layers} "
+        f"num_queries={args.num_queries} "
+        f"num_queries_o2m={args.num_queries_o2m} "
+        f"num_heads={args.num_heads} "
+        f"dim_feedforward={args.dim_feedforward}"
+    )
+    print(
+        "runtime_cfg="
+        f"num_workers={args.num_workers} "
+        f"pin_memory={args.pin_memory} "
+        f"amp={use_amp}"
+    )
     print(f"train_batches={len(train_loader)} eval_samples={len(eval_dataset)}")
 
     started = time.time()
@@ -109,11 +148,15 @@ def train(args: argparse.Namespace) -> None:
             ]
 
             optimizer.zero_grad(set_to_none=True)
-            losses = model(images, targets, epoch=epoch + 1)
-            loss = losses["loss"]
-            loss.backward()
+            amp_context = torch.autocast(device_type="cuda", dtype=torch.float16) if use_amp else nullcontext()
+            with amp_context:
+                losses = model(images, targets, epoch=epoch + 1)
+                loss = losses["loss"]
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
 
             running_loss += float(loss.item())
             steps += 1
@@ -167,6 +210,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--preview-topk", type=int, default=5)
     parser.add_argument("--output", type=str, default="artifacts/voc_car_checkpoint.pt")
+    parser.add_argument("--backbone-name", type=str, default="resnet34")
+    parser.add_argument("--hidden-dim", type=int, default=128)
+    parser.add_argument("--num-feature-levels", type=int, default=4)
+    parser.add_argument("--transformer-encoder-layers", type=int, default=6)
+    parser.add_argument("--num-queries", type=int, default=100)
+    parser.add_argument("--num-queries-o2m", type=int, default=100)
+    parser.add_argument("--num-decoder-layers", type=int, default=6)
+    parser.add_argument("--num-heads", type=int, default=4)
+    parser.add_argument("--num-decoder-points", type=int, default=4)
+    parser.add_argument("--dim-feedforward", type=int, default=256)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--pin-memory", type=parse_bool, default=True)
+    parser.add_argument("--amp", type=parse_bool, default=True)
     parser.set_defaults(pretrained_backbone=True)
     parser.add_argument("--pretrained-backbone", dest="pretrained_backbone", action="store_true")
     parser.add_argument("--no-pretrained-backbone", dest="pretrained_backbone", action="store_false")

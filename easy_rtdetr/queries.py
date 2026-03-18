@@ -19,6 +19,7 @@ class QuerySelectionOutput:
     encoder_logits: torch.Tensor
     groups: list[QueryGroup]
     memory: torch.Tensor
+    memory_mask: torch.Tensor
 
 
 class QuerySelection(nn.Module):
@@ -83,10 +84,14 @@ class QuerySelection(nn.Module):
         self,
         memory: torch.Tensor,
         spatial_shapes: torch.Tensor,
+        memory_mask: torch.Tensor | None = None,
         targets: list[dict[str, torch.Tensor]] | None = None,
     ) -> QuerySelectionOutput:
         anchors, valid_mask = self._generate_anchors(spatial_shapes, memory.device, memory.dtype)
-        masked_memory = torch.where(valid_mask, memory, torch.zeros_like(memory))
+        combined_valid_mask = valid_mask
+        if memory_mask is not None:
+            combined_valid_mask = combined_valid_mask & memory_mask.unsqueeze(-1)
+        masked_memory = torch.where(combined_valid_mask, memory, torch.zeros_like(memory))
         mapped_memory = self.map_memory(masked_memory.detach())
         targets_out = []
         reference_points_unact = []
@@ -101,7 +106,8 @@ class QuerySelection(nn.Module):
             is_o2m = self.o2m_branch and group_index == total_groups - 1 and self.training
             query_count = self.num_queries_o2m if is_o2m else self.num_queries
             group_name = "o2m" if is_o2m else f"o2o_{group_index}"
-            encoded = self.encoder_proj[group_index](masked_memory)
+            proposal_source = masked_memory if is_primary else mapped_memory
+            encoded = self.encoder_proj[group_index](proposal_source)
             scores = self.encoder_score_heads[group_index](encoded)
             box_unact = self.encoder_box_heads[group_index](encoded) + anchors
 
@@ -111,8 +117,7 @@ class QuerySelection(nn.Module):
             if self.learnt_init_query:
                 group_target = self.tgt_embed.weight[:query_count].unsqueeze(0).expand(memory.size(0), -1, -1)
             else:
-                source_memory = encoded if is_primary else mapped_memory
-                group_target = gather_batch(source_memory, topk)
+                group_target = gather_batch(encoded.detach(), topk)
             group_reference_points = gather_batch(box_unact, topk)
 
             dn_count = 0
@@ -160,6 +165,7 @@ class QuerySelection(nn.Module):
             encoder_logits=torch.cat(encoder_logits, dim=1),
             groups=groups,
             memory=masked_memory,
+            memory_mask=combined_valid_mask.squeeze(-1),
         )
 
     def _generate_anchors(

@@ -10,6 +10,26 @@ def inverse_sigmoid(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
     return torch.log(x / (1.0 - x))
 
 
+def get_sine_pos_embed(
+    pos_tensor: torch.Tensor,
+    num_pos_feats: int,
+    temperature: float = 10000.0,
+    scale: float = 2.0 * torch.pi,
+) -> torch.Tensor:
+    if num_pos_feats <= 0:
+        raise ValueError("num_pos_feats must be positive.")
+    dim_t = torch.arange(num_pos_feats, device=pos_tensor.device, dtype=pos_tensor.dtype)
+    dim_t = temperature ** (2 * torch.div(dim_t, 2, rounding_mode="floor") / num_pos_feats)
+
+    embeds = []
+    for index in range(pos_tensor.size(-1)):
+        pos = pos_tensor[..., index] * scale
+        pos = pos.unsqueeze(-1) / dim_t
+        pos = torch.stack((pos[..., 0::2].sin(), pos[..., 1::2].cos()), dim=-1).flatten(-2)
+        embeds.append(pos)
+    return torch.cat(embeds, dim=-1)
+
+
 def box_cxcywh_to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
     cx, cy, w, h = boxes.unbind(dim=-1)
     half_w = w / 2.0
