@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,6 +61,9 @@ def _xyxy_to_normalized_cxcywh(boxes: torch.Tensor, image_size: int) -> torch.Te
     w = (x1 - x0) / image_size
     h = (y1 - y0) / image_size
     return torch.stack((cx, cy, w, h), dim=-1)
+
+
+BDD100K_VEHICLE_CLASSES = ("car", "truck", "bus")
 
 
 class PennFudanPedDataset(Dataset):
@@ -195,6 +199,148 @@ class PascalVOCCarDataset(Dataset):
 
     def _annotation_has_car(self, annotation_path: Path) -> bool:
         return bool(self._load_car_boxes(annotation_path).numel())
+
+
+class BDD100KVehicleDataset(Dataset):
+    def __init__(
+        self,
+        root: str | Path,
+        image_size: int = 256,
+        split: str = "train",
+        indices: list[int] | None = None,
+        classes: tuple[str, ...] = BDD100K_VEHICLE_CLASSES,
+        positive_only: bool = True,
+    ) -> None:
+        self.root = Path(root)
+        self.image_size = image_size
+        self.split = split
+        self.class_names = tuple(classes)
+        self.class_to_index = {name: index for index, name in enumerate(self.class_names)}
+        self.positive_only = positive_only
+
+        label_file_candidates = [
+            self.root / "labels" / f"det_{split}_vehicle3.json",
+            self.root / "labels" / f"det_{split}.json",
+        ]
+        label_dir_candidates = [
+            self.root / "labels" / "100k" / split,
+            self.root / "100k" / split,
+        ]
+        label_path = next((candidate for candidate in label_file_candidates if candidate.exists()), None)
+        label_dir = next((candidate for candidate in label_dir_candidates if candidate.exists()), None)
+        if label_path is None and label_dir is None:
+            raise FileNotFoundError(f"BDD100K labels not found for split={split}")
+
+        image_dir_candidates = [
+            self.root / "images" / split,
+            self.root / "images" / "100k" / split,
+            self.root / "10k" / split,
+        ]
+        image_dir = next((candidate for candidate in image_dir_candidates if candidate.exists()), None)
+        if image_dir is None:
+            raise FileNotFoundError(f"BDD100K image directory not found for split={split}: {image_dir_candidates[0]}")
+
+        samples: list[dict[str, object]] = []
+        if label_path is not None:
+            entries = json.loads(label_path.read_text(encoding="utf-8"))
+            if not isinstance(entries, list):
+                raise ValueError(f"Unexpected BDD100K label format in {label_path}")
+            for entry in entries:
+                sample = self._sample_from_aggregate_entry(entry, image_dir)
+                if sample is None:
+                    continue
+                if positive_only and not sample["boxes"]:
+                    continue
+                samples.append(sample)
+        else:
+            assert label_dir is not None
+            for annotation_path in sorted(label_dir.glob("*.json")):
+                sample = self._sample_from_frame_file(annotation_path, image_dir)
+                if sample is None:
+                    continue
+                if positive_only and not sample["boxes"]:
+                    continue
+                samples.append(sample)
+
+        if not samples:
+            raise FileNotFoundError(f"No BDD100K samples found under {self.root} for split={split}")
+        self.samples = samples if indices is None else [samples[index] for index in indices]
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, item: int) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        sample = self.samples[item]
+        image = Image.open(sample["image_path"]).convert("RGB")
+        boxes_xyxy = torch.tensor(sample["boxes"], dtype=torch.float32) if sample["boxes"] else torch.zeros((0, 4), dtype=torch.float32)
+        labels = torch.tensor(sample["labels"], dtype=torch.long) if sample["labels"] else torch.zeros((0,), dtype=torch.long)
+        image, resize_info = _letterbox_image(image, self.image_size, interpolation=InterpolationMode.BILINEAR)
+        boxes_xyxy = _resize_xyxy_boxes(boxes_xyxy, resize_info, self.image_size)
+        boxes = _xyxy_to_normalized_cxcywh(boxes_xyxy, self.image_size)
+        image_tensor = TF.pil_to_tensor(image).float() / 255.0
+        target = {
+            "labels": labels,
+            "boxes": boxes.to(dtype=torch.float32),
+        }
+        return image_tensor, target
+
+    def _parse_vehicle_annotations(self, raw_labels: object) -> tuple[list[list[float]], list[int]]:
+        if not isinstance(raw_labels, list):
+            return [], []
+        boxes: list[list[float]] = []
+        labels: list[int] = []
+        for raw_label in raw_labels:
+            if not isinstance(raw_label, dict):
+                continue
+            category = raw_label.get("category")
+            if category not in self.class_to_index:
+                continue
+            box2d = raw_label.get("box2d")
+            if not isinstance(box2d, dict):
+                continue
+            try:
+                x0 = float(box2d["x1"])
+                y0 = float(box2d["y1"])
+                x1 = float(box2d["x2"])
+                y1 = float(box2d["y2"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if x1 <= x0 or y1 <= y0:
+                continue
+            boxes.append([x0, y0, x1, y1])
+            labels.append(self.class_to_index[str(category)])
+        return boxes, labels
+
+    def _sample_from_aggregate_entry(self, entry: object, image_dir: Path) -> dict[str, object] | None:
+        if not isinstance(entry, dict):
+            return None
+        image_name = entry.get("name")
+        if not isinstance(image_name, str):
+            return None
+        image_path = image_dir / image_name
+        if not image_path.exists():
+            return None
+        boxes, labels = self._parse_vehicle_annotations(entry.get("labels"))
+        return {"image_path": image_path, "boxes": boxes, "labels": labels}
+
+    def _sample_from_frame_file(self, annotation_path: Path, image_dir: Path) -> dict[str, object] | None:
+        entry = json.loads(annotation_path.read_text(encoding="utf-8"))
+        if not isinstance(entry, dict):
+            return None
+        image_name = entry.get("name")
+        if not isinstance(image_name, str):
+            return None
+        image_path = image_dir / f"{image_name}.jpg"
+        if not image_path.exists():
+            return None
+        frames = entry.get("frames")
+        if not isinstance(frames, list) or not frames:
+            return {"image_path": image_path, "boxes": [], "labels": []}
+        frame = frames[0]
+        if not isinstance(frame, dict):
+            return {"image_path": image_path, "boxes": [], "labels": []}
+        boxes, labels = self._parse_vehicle_annotations(frame.get("objects"))
+        return {"image_path": image_path, "boxes": boxes, "labels": labels}
 
 
 def split_indices(length: int, train_fraction: float = 0.8, seed: int = 0) -> tuple[list[int], list[int]]:
