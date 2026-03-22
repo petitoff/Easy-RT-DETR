@@ -35,38 +35,45 @@ DEFAULT_EXCLUDES = [
 
 PRESETS: dict[str, dict[str, object]] = {
     "train-pennfudan": {
-        "script": "scripts/train_pennfudan_cpu.py",
+        "script": "scripts/train.py",
+        "args": ["--config", "configs/pennfudan/base.yaml", "--output", "artifacts/pennfudan_remote.pt"],
         "artifacts": ["artifacts/*.pt"],
         "description": "Train Penn-Fudan model remotely.",
     },
     "train-synthetic": {
-        "script": "scripts/train_synthetic_cpu.py",
+        "script": "scripts/train.py",
+        "args": ["--config", "configs/synthetic/base.yaml", "--output", "artifacts/synthetic_remote.pt"],
         "artifacts": ["artifacts/*.pt"],
         "description": "Train synthetic rectangles model remotely.",
         "exclude": ["data"],
     },
     "eval-pennfudan": {
-        "script": "scripts/eval_pennfudan_checkpoint.py",
+        "script": "scripts/eval.py",
+        "args": ["--config", "configs/pennfudan/base.yaml"],
         "artifacts": [],
         "description": "Run Penn-Fudan checkpoint evaluation remotely.",
     },
     "visualize-pennfudan": {
-        "script": "scripts/visualize_pennfudan_predictions.py",
+        "script": "scripts/visualize.py",
+        "args": ["--config", "configs/pennfudan/base.yaml"],
         "artifacts": ["artifacts/**/*.png"],
         "description": "Render prediction visualizations remotely.",
     },
     "train-voc-car": {
-        "script": "scripts/train_voc_car.py",
+        "script": "scripts/train.py",
+        "args": ["--config", "configs/voc_car/base.yaml", "--output", "artifacts/voc_car_remote.pt"],
         "artifacts": ["artifacts/*.pt"],
         "description": "Train Pascal VOC car-only model remotely.",
     },
     "eval-voc-car": {
-        "script": "scripts/eval_voc_car_checkpoint.py",
+        "script": "scripts/eval.py",
+        "args": ["--config", "configs/voc_car/base.yaml"],
         "artifacts": [],
         "description": "Run Pascal VOC car-only checkpoint evaluation remotely.",
     },
     "visualize-voc-car": {
-        "script": "scripts/visualize_voc_car_predictions.py",
+        "script": "scripts/visualize.py",
+        "args": ["--config", "configs/voc_car/base.yaml"],
         "artifacts": ["artifacts/**/*.png"],
         "description": "Render Pascal VOC car-only visualizations remotely.",
     },
@@ -472,20 +479,22 @@ def build_run_configuration(args: argparse.Namespace) -> tuple[str, list[str], l
         if not args.script:
             raise ValueError("--script is required when preset=custom")
         script_path = args.script
+        preset_args: list[str] = []
         artifact_paths = []
         preset_excludes: list[str] = []
     else:
         preset = PRESETS[args.preset]
         script_path = str(preset["script"])
+        preset_args = list(preset.get("args", []))
         artifact_paths = list(preset["artifacts"])
         preset_excludes = list(preset.get("exclude", []))
 
-    script_args = list(args.script_args)
+    script_args = [*preset_args, *list(args.script_args)]
     if script_args and script_args[0] == "--":
         script_args = script_args[1:]
 
-    if args.device is not None and "--device" not in script_args and script_path.endswith(("train_pennfudan_cpu.py", "train_synthetic_cpu.py")):
-        script_args = ["--device", args.device, *script_args]
+    if args.device is not None and script_path.endswith("train.py") and "runtime.device=" not in " ".join(script_args):
+        script_args.extend(["--set", f"runtime.device={args.device}"])
 
     if args.artifact:
         artifact_paths.extend(args.artifact)
