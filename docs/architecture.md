@@ -126,6 +126,18 @@ Najwazniejsze braki wzgledem referencji RT-DETRv3:
 
 - brak pelnego portu wszystkich szczegolow `PPYOLOEHead`,
 - brak pelnej parity calego ekosystemu PaddleDet,
-- brak klasycznej oceny `mAP` w repo,
+- brak pelnego eksportu produkcyjnego, np. dopracowanego ONNX/inference backend,
 - brak kompatybilnosci starych checkpointow po wiekszych zmianach architektury,
 - brak szerokiego benchmarku na wiecej niz jednym lub dwoch datasetach.
+
+## Warstwa treningowa i eksperymentalna
+
+Po refaktorze repo architektura modelu jest otoczona nowym wspolnym stackiem:
+
+- YAML configi eksperymentow,
+- solver,
+- builders danych,
+- optimizer + scheduler + warmup + EMA,
+- nowe CLI.
+
+To nie zmienia samego forward pass modelu, ale istotnie zmienia sposob uruchamiania treningu i eksperymentow.

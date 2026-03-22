@@ -8,6 +8,7 @@ theme:
 nav:
   - Start: index.md
   - Architektura: architecture.md
+  - Workflow i CLI: workflow.md
   - Eksperymenty i Wyniki: experiments.md
   - Zdalny Trening GPU: remote-training.md
   - Status i Roadmapa: status.md

@@ -2,7 +2,7 @@
 
 Ten dokument zbiera najwazniejsze etapy eksperymentow wykonanych do tej pory.
 
-## 1. Pierwsze uruchomienie na CPU
+## 1. Weryfikacja bazowa na CPU
 
 Poczatkowo model byl sprawdzany lokalnie na CPU:
 
@@ -15,23 +15,21 @@ To potwierdzilo, ze sama logika modelu i treningu dziala bez CUDA.
 
 ## 2. Penn-Fudan Pedestrian
 
-Penn-Fudan zostal wybrany jako pierwszy realny dataset, bo:
+Penn-Fudan byl pierwszym realnym datasetem:
 
-- jest maly,
-- ma prawdziwe obrazy,
-- ma gotowe boxy,
-- jedna klasa upraszcza debugowanie.
+- maly,
+- prosty,
+- jedna klasa,
+- bardzo dobry do debugowania boxow i lossow.
 
 ### Najwazniejsze obserwacje
 
-Najpierw okazalo sie, ze problem nie lezal w anotacjach. Boxy z masek i oficjalnych adnotacji pokrywaly sie poprawnie.
+Kluczowe poprawy jakosci przyszly z:
 
-Najwieksza poprawa przyszla z:
-
-- `letterbox` zamiast brutalnego resize do kwadratu,
+- `letterbox` zamiast deformujacego resize,
 - lepszego postprocessu,
 - dluzszego treningu,
-- stopniowego zblizania treningu do referencji RT-DETRv3,
+- parity z RT-DETRv3 w query selection i denoising,
 - auxiliary branch w stylu PP-YOLOE.
 
 ### Mocny punkt odniesienia
@@ -46,62 +44,63 @@ Najbardziej udany checkpoint Penn-Fudan po treningu na GPU dawal profil:
 W praktyce oznaczalo to:
 
 - bardzo dobre polozenie boxow,
-- brak problemu z duplikatami,
+- brak duplikatow,
 - sensowny recall jak na maly eksperymentalny setup.
 
 ## 3. VOC 2007 - tylko klasa `car`
 
-Nastepny krok to trenowanie modelu tylko na samochodach z Pascal VOC 2007.
+VOC `car` byl pierwszym sensownym testem poza jedna klasa pieszych.
 
-Powody:
+### Wczesne biegi
 
-- inna domena niz piesi,
-- bardziej zroznicowane obrazy,
-- mozliwosc szybkiego sprawdzenia transferu poza jeden benchmark.
+Pierwsze checkpointy pokazywaly, ze model:
 
-### Baseline VOC `car`
+- poprawnie lokalizuje samochody,
+- jest raczej konserwatywny score'owo,
+- generalizuje na customowe zdjecia lepiej niz czysto zabawkowy baseline.
 
-Pierwszy sensowny checkpoint dla samochodow trenowany na GPU dal:
+### Przebudowa architektury
 
-- `avg_best_iou ~= 0.642`
-- `pred_precision_proxy@0.50 ~= 0.769`
-- `gt_recall@0.50 ~= 0.490`
+W kolejnych iteracjach dodano:
+
+- parity elementow transformera wzgledem `ppdet`,
+- nowy `HybridEncoder`,
+- auxiliary path w stylu PP-YOLOE,
+- training recipe z EMA, schedulerem i lepszym backbone.
+
+### Mocniejszy wariant VOC
+
+Po dluzszym treningu z `ResNet34`, AMP i nowym training stackiem uzyskano profil:
+
+- `avg_best_iou ~= 0.662`
+- `pred_precision_proxy@0.50 ~= 0.747`
+- `gt_recall@0.50 ~= 0.518`
 - `duplicate_pair_ratio@0.40 = 0.000`
+- `AP50 ~= 0.473`
+- `AP75 ~= 0.357`
+- `mAP@0.50:0.95 ~= 0.337`
 
-To nie jest poziom Penn-Fudan, ale wynik byl obiecujacy:
+To jest obecny formalny punkt odniesienia dla samochodow.
 
-- model poprawnie lokalizowal samochody,
-- nawet na customowych zdjeciach potrafil zwracac sensowne boxy,
-- score byl raczej konserwatywny niz agresywny.
+## 4. BDD100K vehicle-3
 
-### Nowy HybridEncoder
+Dodano tez pipeline dla nowoczesniejszego datasetu drogowego:
 
-Po przebudowie `HybridEncoder` wykonano kolejny bieg na VOC `car`.
+- klasy `car`
+- `truck`
+- `bus`
 
-Wynik po `5` epokach:
+Zakres zaimplementowany:
 
-- `avg_best_iou ~= 0.581`
-- `pred_precision_proxy@0.50 ~= 0.672`
-- `gt_recall@0.50 ~= 0.356`
-- `duplicate_pair_ratio@0.40 = 0.000`
+- przygotowanie odfiltrowanego subsetu,
+- dataset loader,
+- integracja z MinIO,
+- cache po stronie Kaggle przez `mini-mlflow-cli`,
+- smoke training na GPU.
 
-Interpretacja:
+To jest baza pod dalsze bardziej realistyczne eksperymenty wieloklasowe.
 
-- nowy neck nie wygral jeszcze po krotkim treningu,
-- prawdopodobnie potrzebuje dluzszego biegu i ewentualnego dostrojenia hiperparametrow,
-- sama zmiana architektury nie daje automatycznego zysku po bardzo krotkim fine-tuningu.
-
-## 4. Wnioski z wynikow
-
-Najwazniejsze wnioski praktyczne:
-
-- model jest juz realnie uzywalny jako prototyp detekcji,
-- pipeline dziala lokalnie i zdalnie,
-- poprawa parity z referencja realnie pomogla na Penn-Fudan,
-- VOC `car` pokazal, ze model generalizuje poza jedna klase,
-- nowy neck wymaga jeszcze pelniejszego eksperymentu treningowego.
-
-## 5. Jak interpretowac score typu `0.29`
+## 5. Jak interpretowac score modelu
 
 Score przy boxie:
 
@@ -109,9 +108,18 @@ Score przy boxie:
 - sluzy do rankingu i filtrowania,
 - nie jest idealnie skalibrowanym prawdopodobienstwem.
 
-Dlatego poprawny box moze miec stosunkowo niski score, szczegolnie gdy:
+Dlatego w repo dodano tez prosty etap kalibracji precision. Dzieki temu wizualizacje moga pokazywac:
 
-- trening byl krotki,
-- dataset jest maly,
-- domena testowa rozni sie od treningowej,
-- model zostal ustawiony bardziej konserwatywnie.
+- `raw=...` jako surowy score modelu,
+- `p=...` jako oszacowana precyzja empiryczna na zbiorze ewaluacyjnym.
+
+## 6. Wnioski z wynikow
+
+Najwazniejsze wnioski praktyczne:
+
+- model jest juz uzywalnym research prototype, a nie tylko szkicem,
+- pipeline dziala lokalnie i zdalnie,
+- Penn-Fudan pokazal mocna jakosc lokalizacji,
+- VOC `car` pokazal sensowna generalizacje i daje juz formalne `mAP`,
+- BDD100K daje nowy kierunek pod bardziej realistyczne sceny drogowe,
+- najwiekszy dalszy zysk prawdopodobnie bedzie teraz z lepszego recipe i wiekszych datasetow, nie tylko z dalszego komplikowania architektury.

@@ -10,6 +10,7 @@ Wykorzystywane sa:
 - `scripts/run_remote.py` jako lokalny runner,
 - `scripts/remote_dispatch.py` jako entrypoint po stronie zdalnej,
 - MinIO jako storage bridge dla datasetow i artefaktow.
+- glowny workflow treningowy opiera sie juz na `scripts/train.py` i YAML configach.
 
 ## Dlaczego MinIO
 
@@ -44,6 +45,12 @@ Runner ma przygotowane presety:
 - `eval-voc-car`
 - `visualize-voc-car`
 
+W praktyce presety sa teraz cienka warstwa nad wspolnymi wrapperami:
+
+- `scripts/train.py`
+- `scripts/eval.py`
+- `scripts/visualize.py`
+
 ## Typowy przeplyw
 
 Przyklad dla VOC `car`:
@@ -54,12 +61,13 @@ Przyklad dla VOC `car`:
   --minio-endpoint http://188.245.77.217:9000 \
   --minio-access-key admin \
   --minio-secret-key '***' \
-  -- --epochs 5 --batch-size 4 --image-size 256 --output artifacts/voc_car_kaggle_5e.pt
+  -- --set solver.epochs=5 --set solver.batch_size=4
 ```
 
 ## Co dziala dobrze
 
 - zdalne uruchamianie skryptow treningowych,
+- reuse datasetow stage'owanych do MinIO,
 - staging datasetow do MinIO,
 - pobieranie checkpointow,
 - uruchamianie na Kaggle GPU bez lokalnego CUDA.
